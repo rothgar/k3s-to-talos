@@ -179,6 +179,12 @@ func IsDisconnectError(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
+	// ExitMissingError occurs when the remote process is killed (e.g. syscall.Reboot)
+	// before it can send an SSH exit status.
+	var exitMissing *ssh.ExitMissingError
+	if errors.As(err, &exitMissing) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "EOF") ||
 		strings.Contains(msg, "connection reset") ||
