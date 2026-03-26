@@ -8,6 +8,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/k3s"
+	"github.com/rothgar/k3s-to-talos/internal/talos"
 )
 
 var (
@@ -42,6 +43,13 @@ func PrintClusterSummary(info *k3s.ClusterInfo, backupDir string) {
 	fmt.Printf("  %-22s %s\n", "k3s version:", info.K3sVersion)
 	fmt.Printf("  %-22s %s\n", "Kubernetes version:", info.K8sVersion)
 	fmt.Printf("  %-22s %s\n", "Datastore:", info.DatastoreType)
+	if info.Hardware != nil {
+		archDesc := info.Hardware.RawArch
+		if info.Hardware.IsRaspberryPi {
+			archDesc = fmt.Sprintf("%s (%s)", info.Hardware.RawArch, info.Hardware.PiModel)
+		}
+		fmt.Printf("  %-22s %s\n", "Architecture:", archDesc)
+	}
 	fmt.Printf("  %-22s %d\n", "Nodes:", len(info.Nodes))
 	fmt.Printf("  %-22s %d\n", "Namespaces:", len(info.Namespaces))
 	fmt.Printf("  %-22s %d\n", "Workloads:", info.WorkloadCount)
@@ -122,6 +130,37 @@ func PrintMultiNodeWarning(nodes []k3s.Node) {
 	yellow.Println("  Worker nodes will lose connectivity during their migration.")
 	fmt.Println("  Ensure workloads can tolerate the temporary disruption.")
 	fmt.Println()
+}
+
+// PrintRaspberryPiWarning prints a notice when the target is a Raspberry Pi 4/5
+// that requires a custom image from factory.talos.dev.
+func PrintRaspberryPiWarning(hw *talos.HardwareInfo) {
+	if hw == nil || !hw.IsRaspberryPi {
+		return
+	}
+	fmt.Println()
+	yellow.Println("┌─────────────────────────────────────────────────────────────┐")
+	yellow.Printf( "│  Raspberry Pi %d detected: %s\n", hw.PiGen,
+		padRight(hw.PiModel, 35)+"│")
+	yellow.Println("├─────────────────────────────────────────────────────────────┤")
+	yellow.Println("│  Talos Linux requires a CUSTOM IMAGE for Raspberry Pi 4/5.  │")
+	yellow.Println("│                                                              │")
+	yellow.Println("│  A schematic with the 'rpi_generic' overlay will be         │")
+	yellow.Println("│  submitted to factory.talos.dev to generate the correct     │")
+	yellow.Println("│  arm64 image. This requires outbound internet access from   │")
+	yellow.Println("│  the machine running k3s-to-talos.                          │")
+	yellow.Println("│                                                              │")
+	yellow.Println("│  Standard amd64 images will NOT boot on Raspberry Pi.       │")
+	yellow.Println("└─────────────────────────────────────────────────────────────┘")
+	fmt.Println()
+}
+
+// padRight pads or truncates s to exactly n characters.
+func padRight(s string, n int) string {
+	if len(s) >= n {
+		return s[:n]
+	}
+	return s + strings.Repeat(" ", n-len(s))
 }
 
 // PrintIrreversibilityWarning prints a prominent red warning about the irreversible nature.

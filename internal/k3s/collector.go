@@ -4,23 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/briandowns/spinner"
 	"github.com/rothgar/k3s-to-talos/internal/ssh"
-	"time"
+	"github.com/rothgar/k3s-to-talos/internal/talos"
 )
 
 // ClusterInfo holds information about the k3s cluster gathered remotely.
 type ClusterInfo struct {
-	K3sVersion    string  `json:"k3s_version"`
-	K8sVersion    string  `json:"k8s_version"`
-	ClusterName   string  `json:"cluster_name"`
-	Nodes         []Node  `json:"nodes"`
-	DatastoreType string  `json:"datastore_type"` // "etcd" | "sqlite"
-	Namespaces    []string `json:"namespaces"`
-	WorkloadCount int     `json:"workload_count"`
-	PVCount       int     `json:"pv_count"`
-	PVs           []PV    `json:"pvs,omitempty"`
+	K3sVersion    string              `json:"k3s_version"`
+	K8sVersion    string              `json:"k8s_version"`
+	ClusterName   string              `json:"cluster_name"`
+	Nodes         []Node              `json:"nodes"`
+	DatastoreType string              `json:"datastore_type"` // "etcd" | "sqlite"
+	Namespaces    []string            `json:"namespaces"`
+	WorkloadCount int                 `json:"workload_count"`
+	PVCount       int                 `json:"pv_count"`
+	PVs           []PV                `json:"pvs,omitempty"`
+	Hardware      *talos.HardwareInfo `json:"hardware,omitempty"`
 }
 
 // Node represents a Kubernetes node in the k3s cluster.
@@ -64,6 +66,20 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 		return nil, err
 	}
 
+	s.Suffix = " Detecting hardware..."
+	hw, err := talos.DetectHardware(c.ssh)
+	if err != nil {
+		s.Stop()
+		return nil, fmt.Errorf("detecting hardware: %w", err)
+	}
+	info.Hardware = hw
+
+	// Fail fast if the hardware is known to be unsupported.
+	if err := hw.Supported(); err != nil {
+		s.Stop()
+		return nil, err
+	}
+
 	s.Suffix = " Detecting k3s version..."
 	if err := c.collectVersion(info); err != nil {
 		return nil, err
@@ -92,9 +108,15 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 }
 
 func (c *Collector) verifyK3sServer() error {
-	out, err := c.ssh.Run("systemctl is-active k3s 2>/dev/null || systemctl is-active k3s-server 2>/dev/null || echo inactive")
-	if err != nil || strings.TrimSpace(out) == "inactive" {
-		return fmt.Errorf("k3s server service does not appear to be running on the target machine (got: %q)", out)
+	// Check via systemctl first; fall back to process detection for non-systemd systems.
+	active, _ := c.ssh.Run(
+		`systemctl is-active k3s 2>/dev/null || ` +
+			`systemctl is-active k3s-server 2>/dev/null || ` +
+			`(pgrep -f 'k3s server' >/dev/null 2>&1 && echo active) || ` +
+			`echo inactive`)
+	if strings.TrimSpace(active) == "inactive" {
+		return fmt.Errorf("k3s server does not appear to be running on the target machine\n" +
+			"Ensure the k3s server process is active before migrating.")
 	}
 
 	// Confirm it's in server mode (not just agent)
@@ -193,7 +215,10 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 }
 
 func (c *Collector) detectDatastore(info *ClusterInfo) {
-	if c.ssh.FileExists("/var/lib/rancher/k3s/server/db/etcd") {
+	// k3s with --cluster-init runs embedded etcd; etcd member files appear under
+	// the etcd/member directory.  A bare etcd/ directory can exist even in SQLite
+	// mode (k3s creates it), so we look for the member subdirectory specifically.
+	if c.ssh.FileExists("/var/lib/rancher/k3s/server/db/etcd/member") {
 		info.DatastoreType = "etcd"
 	} else {
 		info.DatastoreType = "sqlite"

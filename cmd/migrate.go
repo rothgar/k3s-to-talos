@@ -84,7 +84,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("collecting k3s info: %w", err)
 		}
 
-		backup := k3s.NewBackup(sshClient, flagBackupDir)
+		backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
 		if err := backup.Run(info, flagDryRun); err != nil {
 			return fmt.Errorf("backing up k3s data: %w", err)
 		}
@@ -105,6 +105,10 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	if len(state.ClusterInfo.Nodes) > 1 {
 		ui.PrintMultiNodeWarning(state.ClusterInfo.Nodes)
+	}
+
+	if state.ClusterInfo.Hardware != nil && state.ClusterInfo.Hardware.IsRaspberryPi {
+		ui.PrintRaspberryPiWarning(state.ClusterInfo.Hardware)
 	}
 
 	ui.PrintIrreversibilityWarning(flagHost)
@@ -177,6 +181,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			TalosVersion:   flagTalosVersion,
 			ControlPlaneIP: flagHost,
 			ConfigFile:     filepath.Join(state.TalosConfigDir, "controlplane.yaml"),
+			Hardware:       state.ClusterInfo.Hardware,
 		}); err != nil {
 			// SSH will drop when the machine reboots — that's expected
 			if !ssh.IsDisconnectError(err) {

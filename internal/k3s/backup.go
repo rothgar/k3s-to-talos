@@ -23,11 +23,14 @@ import (
 type Backup struct {
 	ssh       *ssh.Client
 	backupDir string
+	sshHost   string // the host we SSH'd to; used to rewrite kubeconfig server address
 }
 
 // NewBackup creates a new Backup instance.
-func NewBackup(sshClient *ssh.Client, backupDir string) *Backup {
-	return &Backup{ssh: sshClient, backupDir: backupDir}
+// sshHost is the IP/hostname used for the SSH connection; it becomes the
+// server address in the downloaded kubeconfig so client-go can connect.
+func NewBackup(sshClient *ssh.Client, backupDir, sshHost string) *Backup {
+	return &Backup{ssh: sshClient, backupDir: backupDir, sshHost: sshHost}
 }
 
 // Run performs all backup operations.
@@ -176,9 +179,15 @@ func (b *Backup) downloadKubeconfig(localPath string) error {
 		return err
 	}
 
-	// Rewrite localhost/127.0.0.1 to the actual host IP so we can connect remotely
-	host := b.ssh.RunIgnoreError("hostname -I | awk '{print $1}'")
-	host = strings.TrimSpace(host)
+	// Rewrite the server address to use the SSH target host so client-go can
+	// reach the API server from the operator's machine.
+	// Prefer the explicit SSH host (--host flag) because the k3s TLS cert
+	// covers the node's advertised IP and 127.0.0.1 — using a different IP
+	// (e.g. from `hostname -I`) would cause certificate validation failures.
+	host := b.sshHost
+	if host == "" {
+		host = strings.TrimSpace(b.ssh.RunIgnoreError("hostname -I | awk '{print $1}'"))
+	}
 	if host == "" {
 		return nil
 	}
@@ -186,7 +195,39 @@ func (b *Backup) downloadKubeconfig(localPath string) error {
 	updated := strings.ReplaceAll(string(data), "https://127.0.0.1", fmt.Sprintf("https://%s", host))
 	updated = strings.ReplaceAll(updated, "https://localhost", fmt.Sprintf("https://%s", host))
 
+	// k3s signs its serving cert for the node's own IPs; when connecting remotely
+	// via the SSH target host the cert SANs may not match.  Switch to insecure
+	// mode so client-go can still enumerate resources for backup purposes.
+	// This backup kubeconfig is never used for the new Talos cluster — a fresh
+	// kubeconfig is retrieved via talosctl after bootstrap.
+	updated = rewriteKubeconfigInsecure(updated)
+
 	return os.WriteFile(localPath, []byte(updated), 0600)
+}
+
+// rewriteKubeconfigInsecure replaces certificate-authority-data with
+// insecure-skip-tls-verify so client-go can connect without cert validation.
+// This is intentional for the collect/backup phase only.
+func rewriteKubeconfigInsecure(kubeconfig string) string {
+	// Remove any existing certificate-authority-data line (may span multiple
+	// lines due to base64; the value is on a single line in standard kubeconfigs).
+	lines := strings.Split(kubeconfig, "\n")
+	out := make([]string, 0, len(lines))
+	insertedInsecure := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "certificate-authority-data:") {
+			if !insertedInsecure {
+				// Preserve indentation
+				indent := strings.Repeat(" ", len(line)-len(strings.TrimLeft(line, " ")))
+				out = append(out, indent+"insecure-skip-tls-verify: true")
+				insertedInsecure = true
+			}
+			continue // drop the cert data line
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // resourcesToExport defines the GVRs we'll export from the cluster.

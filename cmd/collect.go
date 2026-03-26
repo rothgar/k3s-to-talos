@@ -50,7 +50,7 @@ func runCollect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("collecting k3s info: %w", err)
 	}
 
-	backup := k3s.NewBackup(sshClient, flagBackupDir)
+	backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
 	if err := backup.Run(info, false); err != nil {
 		return fmt.Errorf("backing up k3s data: %w", err)
 	}

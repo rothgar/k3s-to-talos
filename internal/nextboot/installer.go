@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"text/template"
@@ -17,6 +16,7 @@ import (
 	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/ssh"
+	"github.com/rothgar/k3s-to-talos/internal/talos"
 )
 
 //go:embed assets/nextboot-talos.py.tmpl
@@ -26,7 +26,8 @@ var scriptTemplate string
 type Options struct {
 	TalosVersion   string
 	ControlPlaneIP string
-	ConfigFile     string // path to local controlplane.yaml
+	ConfigFile     string              // path to local controlplane.yaml
+	Hardware       *talos.HardwareInfo // detected hardware; nil defaults to amd64
 }
 
 // Installer uploads and runs nextboot-talos on the remote machine.
@@ -44,14 +45,20 @@ func NewInstaller(sshClient *ssh.Client, backupDir string) *Installer {
 func (i *Installer) Run(opts Options) error {
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 
-	// 1. Resolve the Talos image URL and hash
+	// 1. Resolve the Talos image URL and hash (hardware-aware).
 	s.Suffix = " Resolving Talos image URL..."
 	s.Start()
 
-	imageURL, imageHash, err := resolveImageInfo(opts.TalosVersion)
+	hw := opts.Hardware
+	if hw == nil {
+		// Fallback: assume amd64 if no hardware info was provided.
+		hw = &talos.HardwareInfo{Arch: talos.ArchAMD64}
+	}
+
+	imageURL, imageHash, err := talos.ResolveImageURL(opts.TalosVersion, hw)
 	if err != nil {
 		s.Stop()
-		color.Yellow("  Warning: could not fetch image hash (%v); proceeding without hash verification.\n", err)
+		color.Yellow("  Warning: could not resolve image URL (%v); using amd64 default.\n", err)
 		imageURL = fmt.Sprintf(
 			"https://github.com/siderolabs/talos/releases/download/%s/metal-amd64.raw.xz",
 			opts.TalosVersion,
@@ -153,46 +160,6 @@ func renderScript(p scriptParams) (string, error) {
 	return buf.String(), nil
 }
 
-// resolveImageInfo fetches the Talos release page to get the image URL and SHA256 hash.
-func resolveImageInfo(version string) (imageURL, hash string, err error) {
-	// Use the metal-amd64 raw image (x86_64 bare metal)
-	imageURL = fmt.Sprintf(
-		"https://github.com/siderolabs/talos/releases/download/%s/metal-amd64.raw.xz",
-		version,
-	)
-
-	// Fetch the SHA256 checksums file
-	checksumURL := fmt.Sprintf(
-		"https://github.com/siderolabs/talos/releases/download/%s/sha256sum.txt",
-		version,
-	)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(checksumURL)
-	if err != nil {
-		return imageURL, "", fmt.Errorf("fetching checksums: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return imageURL, "", fmt.Errorf("fetching checksums: HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return imageURL, "", fmt.Errorf("reading checksums: %w", err)
-	}
-
-	// Parse sha256sum.txt — format: "<hash>  <filename>"
-	for _, line := range strings.Split(string(body), "\n") {
-		parts := strings.Fields(line)
-		if len(parts) == 2 && strings.Contains(parts[1], "metal-amd64.raw.xz") {
-			return imageURL, parts[0], nil
-		}
-	}
-
-	return imageURL, "", fmt.Errorf("metal-amd64.raw.xz not found in checksums")
-}
 
 // hashFile computes the SHA256 of a local file.
 func hashFile(path string) (string, error) {
