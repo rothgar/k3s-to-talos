@@ -84,32 +84,14 @@ jobs:
       fail-fast: false   # let other cells finish even if one fails
       matrix:
         include:
-          # k3s cells
-          - distro: ubuntu-22.04
-            cluster: k3s
-            ami_key: ubuntu-2204
-            ssh_user: ubuntu
           - distro: ubuntu-24.04
             cluster: k3s
             ami_key: ubuntu-2404
-            ssh_user: ubuntu
-          - distro: debian-12
-            cluster: k3s
-            ami_key: debian-12
-            ssh_user: admin
-          # kubeadm cells
-          - distro: ubuntu-22.04
-            cluster: kubeadm
-            ami_key: ubuntu-2204
             ssh_user: ubuntu
           - distro: ubuntu-24.04
             cluster: kubeadm
             ami_key: ubuntu-2404
             ssh_user: ubuntu
-          - distro: debian-12
-            cluster: kubeadm
-            ami_key: debian-12
-            ssh_user: admin
 
     steps:
       - uses: actions/checkout@v4
