@@ -123,15 +123,29 @@ func Run(opts Options) error {
 		log("Disk layout after partition refresh:\n%s", strings.TrimSpace(string(out)))
 	}
 
-	// ── 4. Patch the Talos EFI partition so hardware reboot works on EC2 ────
-	// EC2's UEFI NVRAM still has the old OS's boot entry (e.g. pointing to
-	// EFI/ubuntu/shimx64.efi).  On EC2 the NVRAM is not updated by in-OS
-	// efibootmgr calls — changes are only persisted on a stop/start cycle,
-	// not a soft reboot.  To make hardware reboot reliable we copy the Talos
-	// GRUB bootloader into the path the existing NVRAM entry references.
+	// ── 4. Ensure hardware reboot boots Talos — two complementary mechanisms ──
+	//
+	// Mechanism A — EFI file patch (copyTalosEFIToLegacyPaths):
+	//   Copies the Talos GRUB EFI binary into the path the existing NVRAM
+	//   entry references (e.g. EFI/ubuntu/shimx64.efi).  Provides a fallback
+	//   if the NVRAM is reset (e.g. EC2 stop/start cycle) but has a subtle
+	//   limitation: if the GRUB binary uses a location-relative prefix to
+	//   find grub.cfg, copying it to a different directory breaks config
+	//   loading and GRUB drops to a rescue shell.
+	//
+	// Mechanism B — BootNext via efibootmgr (updateUEFIBoot):
+	//   Adds a Talos boot entry pointing directly to EFI/BOOT/BOOTX64.EFI
+	//   and sets it as BootNext (consumed on the very next boot).  This
+	//   loads the GRUB binary from its canonical path, so the compiled-in
+	//   prefix is always correct.  Requires writable efivarfs (works on
+	//   EC2 for soft reboots; NVRAM is not reset between reboots, only on
+	//   stop/start).
 	if err := copyTalosEFIToLegacyPaths(disk); err != nil {
-		log("Warning: could not patch Talos EFI partition: %v", err)
-		log("Hardware reboot may not boot Talos if the EFI NVRAM entry points to the old OS.")
+		log("Warning: EFI file patch failed: %v", err)
+	}
+	if err := updateUEFIBoot(disk); err != nil {
+		log("Warning: efibootmgr BootNext failed: %v", err)
+		log("Relying on EFI file patch for boot path.")
 	}
 
 	// ── 5. Write machine config to STATE partition ───────────────────────────

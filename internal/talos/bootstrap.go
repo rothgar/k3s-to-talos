@@ -174,9 +174,9 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 				color.Yellow("\n  ⚠  Port 22 (SSH) is responding on %s\n", host)
 				color.Yellow("  ⚠  This means the machine rebooted back into Ubuntu, not Talos!\n")
 				color.Yellow("  ⚠  Likely causes:\n")
-				color.Yellow("  ⚠    • kexec was blocked (kernel lockdown / Secure Boot enabled)\n")
-				color.Yellow("  ⚠    • Hardware reboot booted Ubuntu (EFI path patch failed)\n")
-				color.Yellow("  ⚠    • EFI partition had stale page cache during the EFI copy\n")
+				color.Yellow("  ⚠    • EFI file patch failed — GRUB loaded Ubuntu instead of Talos\n")
+				color.Yellow("  ⚠    • efibootmgr BootNext not set (efivars read-only on this platform)\n")
+				color.Yellow("  ⚠    • UEFI firmware did not fall back to EFI/BOOT/BOOTX64.EFI\n")
 				color.Yellow("  ⚠  Continuing to wait for Talos API (may not succeed)...\n\n")
 				s.Start()
 			}
