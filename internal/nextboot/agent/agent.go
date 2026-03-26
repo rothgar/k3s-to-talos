@@ -68,26 +68,7 @@ func Run(opts Options) error {
 		}
 	}
 
-	// ── 3. Pre-load Talos kernel via kexec (before disk write) ───────────────
-	// Loading the kernel into RAM *before* overwriting the disk is critical:
-	//  • kexec -l operates on the still-intact Ubuntu system, so no stale
-	//    page-cache or partition-table races
-	//  • If kexec is blocked (Secure Boot / kernel lockdown) we find out now
-	//    and can prepare the EFI fallback path instead of discovering it after
-	//    the disk is already overwritten
-	//  • On success the new kernel sits in RAM; kexec -e fires it instantly
-	//    after the disk is written, completely bypassing UEFI boot order
-	kexecLoaded := false
-	if opts.Reboot {
-		if err := prepareKexec(opts.ImageURL); err != nil {
-			log("kexec preparation failed (%v); will rely on hardware reboot.", err)
-		} else {
-			kexecLoaded = true
-			log("Talos kernel loaded into RAM — will kexec after imaging.")
-		}
-	}
-
-	// ── 4. Download, decompress, write to disk in one streaming pipeline ─────
+	// ── 3. Download, decompress, write to disk in one streaming pipeline ─────
 	log("Starting download → decompress → disk pipeline...")
 	log("  !! This will ERASE all data on %s. Starting in 5 seconds !!", disk)
 	for i := 5; i > 0; i-- {
@@ -148,11 +129,9 @@ func Run(opts Options) error {
 	// efibootmgr calls — changes are only persisted on a stop/start cycle,
 	// not a soft reboot.  To make hardware reboot reliable we copy the Talos
 	// GRUB bootloader into the path the existing NVRAM entry references.
-	// This is belt-and-suspenders with kexec below, which boots without
-	// needing UEFI at all.
 	if err := copyTalosEFIToLegacyPaths(disk); err != nil {
 		log("Warning: could not patch Talos EFI partition: %v", err)
-		log("Hardware reboot may not work on this platform; kexec will be tried first.")
+		log("Hardware reboot may not boot Talos if the EFI NVRAM entry points to the old OS.")
 	}
 
 	// ── 5. Write machine config to STATE partition ───────────────────────────
@@ -173,23 +152,8 @@ func Run(opts Options) error {
 
 	// ── 8. Reboot into Talos ─────────────────────────────────────────────────
 	if opts.Reboot {
-		log("Booting into Talos Linux...")
+		log("Rebooting into Talos Linux via hardware reboot...")
 		time.Sleep(2 * time.Second)
-
-		if kexecLoaded {
-			log("Executing pre-loaded Talos kernel via kexec...")
-			if out, err := exec.Command("kexec", "-e").CombinedOutput(); err != nil {
-				// kexec -e only returns on failure; success kills the process.
-				log("kexec -e failed (%v: %s); falling back to hardware reboot...",
-					err, strings.TrimSpace(string(out)))
-			} else {
-				// Unreachable if kexec succeeded.
-				log("kexec -e returned unexpectedly (no error); hardware reboot...")
-			}
-		} else {
-			log("kexec not loaded — relying on hardware reboot via EFI patching...")
-		}
-
 		return reboot()
 	}
 	log("AUTO_REBOOT disabled — run 'reboot' manually to boot into Talos.")
