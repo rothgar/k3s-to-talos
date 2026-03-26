@@ -302,3 +302,45 @@ jobs:
 
           aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || \
             echo "SG $SG will be cleaned up by the cost-management policy."
+
+  # ── Centralised cleanup — runs even if matrix jobs are cancelled ──────────────
+  cleanup:
+    name: Cleanup EC2 resources
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ec2-test]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terminate all instances for this run
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:GHRunId,Values=${{ github.run_id }}" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ]; then
+            echo "Terminating: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+          else
+            echo "No instances to terminate"
+          fi
+
+      - name: Delete security groups for this run
+        run: |
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=k3s-to-talos-ci-${{ github.run_id }}-*" \
+            --query 'SecurityGroups[].GroupId' \
+            --output text)
+
+          for sg in $SG_IDS; do
+            aws ec2 delete-security-group --group-id "$sg" 2>/dev/null && \
+              echo "Deleted $sg" || echo "Could not delete $sg (may already be gone)"
+          done
