@@ -6,6 +6,7 @@ package agent
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
@@ -546,29 +547,18 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 		return nil
 	}
 
-	// Determine the EFI partition device (partition 1).
-	var efiPart string
-	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") {
-		efiPart = disk + "p1"
-	} else {
-		efiPart = disk + "1"
+	// Use losetup with explicit byte offsets from sfdisk rather than mounting
+	// the partition device (e.g. /dev/xvda1).  This is critical because the
+	// kernel's page-cache and VFS superblock for /dev/xvda1 may still contain
+	// stale Ubuntu EFI data from before the disk overwrite, even after
+	// drop_caches.  losetup maps directly to /dev/xvda at the right offset,
+	// which goes through the /dev/xvda page cache that we updated during the
+	// disk write — so we always see the new Talos data.
+	loopDev, cleanup, err := losetupEFIPartition(disk)
+	if err != nil {
+		return fmt.Errorf("setting up loop device for EFI partition: %w", err)
 	}
-
-	if _, err := os.Stat(efiPart); err != nil {
-		return fmt.Errorf("EFI partition %s not found: %w", efiPart, err)
-	}
-
-	// Flush block buffers for the EFI partition to ensure the new Talos
-	// content is visible (not the cached Ubuntu EFI files).
-	exec.Command("blockdev", "--flushbufs", efiPart).Run() //nolint:errcheck
-
-	// Unmount any stale mount of the EFI partition (Ubuntu mounts it at
-	// /boot/efi).  After dd-ing a new image the VFS superblock is stale; a
-	// lazy unmount + fresh remount forces the kernel to re-read the new
-	// Talos FAT filesystem from disk.
-	for _, staleMP := range []string{"/boot/efi", "/boot/efi/"} {
-		exec.Command("umount", "-l", staleMP).Run() //nolint:errcheck
-	}
+	defer cleanup()
 
 	mountPoint, err := os.MkdirTemp("", "talos-efi-*")
 	if err != nil {
@@ -576,29 +566,12 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 	}
 	defer os.RemoveAll(mountPoint)
 
-	if err := exec.Command("mount", "-o", "ro", efiPart, mountPoint).Run(); err != nil {
-		// Try without -o ro in case of format quirks.
-		if err2 := exec.Command("mount", efiPart, mountPoint).Run(); err2 != nil {
-			return fmt.Errorf("mounting EFI partition %s: %w", efiPart, err2)
-		}
+	if out, err := exec.Command("mount", loopDev, mountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("mounting EFI loop device %s: %w\n%s", loopDev, err, string(out))
 	}
-
-	// Verify we have Talos content (not stale Ubuntu) by checking the
-	// canonical Talos GRUB binary.
-	talosEFICheck := filepath.Join(mountPoint, "EFI", "BOOT", "BOOTX64.EFI")
-	if _, err := os.Stat(talosEFICheck); err != nil {
-		exec.Command("umount", mountPoint).Run() //nolint:errcheck
-		return fmt.Errorf("mounted EFI partition does not contain Talos BOOTX64.EFI "+
-			"(may be stale Ubuntu EFI); path %s missing: %w", talosEFICheck, err)
-	}
-
-	// Remount read-write so we can copy files.
-	exec.Command("mount", "-o", "remount,rw", mountPoint).Run() //nolint:errcheck
 	defer exec.Command("umount", mountPoint).Run() //nolint:errcheck
 
-	// Find the Talos GRUB binary.  Try the fallback path first, then the
-	// Talos-specific path.  Paths on FAT are case-insensitive but we try
-	// common casings.
+	// Find the Talos GRUB binary.
 	var efiData []byte
 	srcCandidates := []string{
 		filepath.Join(mountPoint, "EFI", "BOOT", "BOOTX64.EFI"),
@@ -645,6 +618,87 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 	exec.Command("sync").Run() //nolint:errcheck
 	log("EFI partition patched — hardware reboot will boot Talos via legacy NVRAM entry.")
 	return nil
+}
+
+// losetupEFIPartition finds the EFI partition in the disk's GPT using sfdisk,
+// creates a losetup loop device over the exact byte range, and returns the
+// loop device path along with a cleanup function.
+//
+// Using losetup rather than the partition device (/dev/xvda1) guarantees we
+// read through /dev/xvda's page cache, which contains the freshly written
+// Talos data — not the stale Ubuntu EFI cached by the old /dev/xvda1 VFS
+// superblock.
+func losetupEFIPartition(disk string) (loopDev string, cleanup func(), err error) {
+	cleanup = func() {}
+
+	// Read the partition table directly from the disk device.  sfdisk reads
+	// the raw bytes so it always returns the current (Talos) GPT, not a
+	// kernel-cached view.
+	sfdiskOut, err := exec.Command("sfdisk", "--json", disk).Output()
+	if err != nil {
+		return "", cleanup, fmt.Errorf("sfdisk --json %s: %w", disk, err)
+	}
+
+	var pt struct {
+		PartitionTable struct {
+			SectorSize int64 `json:"sectorsize"`
+			Partitions []struct {
+				Node  string `json:"node"`
+				Start int64  `json:"start"`
+				Size  int64  `json:"size"`
+				Type  string `json:"type"`
+			} `json:"partitions"`
+		} `json:"partitiontable"`
+	}
+	if err := json.Unmarshal(sfdiskOut, &pt); err != nil {
+		return "", cleanup, fmt.Errorf("parsing sfdisk output: %w", err)
+	}
+
+	sectorSize := pt.PartitionTable.SectorSize
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
+
+	// Find the EFI System partition (GUID type C12A7328-…).  Fall back to the
+	// first partition if the GUID is not present (shouldn't happen on a valid
+	// Talos GPT image).
+	var efiStart, efiSize int64
+	for _, p := range pt.PartitionTable.Partitions {
+		if strings.HasPrefix(strings.ToUpper(p.Type), "C12A7328") {
+			efiStart = p.Start
+			efiSize = p.Size
+			log("EFI partition: %s start=%d size=%d sectors (%d MiB)",
+				p.Node, efiStart, efiSize, efiSize*sectorSize>>20)
+			break
+		}
+	}
+	if efiStart == 0 && len(pt.PartitionTable.Partitions) > 0 {
+		p := pt.PartitionTable.Partitions[0]
+		efiStart = p.Start
+		efiSize = p.Size
+		log("EFI partition (fallback first): %s start=%d size=%d sectors",
+			p.Node, efiStart, efiSize)
+	}
+	if efiStart == 0 {
+		return "", cleanup, fmt.Errorf("could not find EFI partition in %s", disk)
+	}
+
+	// Create a loop device pointing to exactly the EFI partition's bytes.
+	out, err := exec.Command("losetup", "-f", "--show",
+		fmt.Sprintf("--offset=%d", efiStart*sectorSize),
+		fmt.Sprintf("--sizelimit=%d", efiSize*sectorSize),
+		disk,
+	).Output()
+	if err != nil {
+		return "", cleanup, fmt.Errorf("losetup: %w", err)
+	}
+	loopDev = strings.TrimSpace(string(out))
+	cleanup = func() {
+		exec.Command("losetup", "-d", loopDev).Run() //nolint:errcheck
+	}
+	log("Created loop device %s → %s offset=%d size=%d bytes",
+		loopDev, disk, efiStart*sectorSize, efiSize*sectorSize)
+	return loopDev, cleanup, nil
 }
 
 // updateUEFIBoot uses efibootmgr to add a Talos boot entry and set it as
