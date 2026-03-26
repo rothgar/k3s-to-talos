@@ -198,15 +198,24 @@ jobs:
             sleep 5
           done
 
-      - name: Wait for cloud-init to complete
+      - name: Wait for cluster to be ready
         run: |
-          # cloud-init runs user-data asynchronously; wait for it to finish
-          # installing k3s/kubeadm before running our tool.
-          ssh -i "$HOME/.ssh/ci_key" \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              "${{ matrix.ssh_user }}@$INSTANCE_IP" \
-              "sudo cloud-init status --wait" 2>&1 || true
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${{ matrix.ssh_user }}@$INSTANCE_IP"
+
+          case "${{ matrix.cluster }}" in
+            k3s)     KUBECTL="sudo k3s kubectl" ;;
+            kubeadm) KUBECTL="sudo kubectl" ;;
+          esac
+
+          echo "Waiting for cluster to become ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if $SSH "$KUBECTL get nodes 2>/dev/null" | grep -q "Ready"; then
+              echo "Cluster ready after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Timeout: cluster not ready after 15 minutes"; exit 1; }
+            sleep 5
+          done
 
       # ── Deploy a test workload so we can verify it survives in the backup ───
       - name: Deploy test workload
