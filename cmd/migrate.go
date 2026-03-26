@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/k3s"
@@ -217,9 +221,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		kubeconfigOut := filepath.Join(flagBackupDir, "talos-kubeconfig")
 
 		// Use etcd recover (from k3s snapshot) instead of bootstrap when available.
+		// Require the file to be at least 1 KiB — a truncated/partial file left
+		// by a failed SFTP download would otherwise fool talosctl into accepting
+		// it, causing bootstrap --recover-from to fail with a cryptic error.
 		snapshotPath := filepath.Join(flagBackupDir, "database", "etcd-snapshot.db")
-		if _, err := os.Stat(snapshotPath); err != nil {
-			snapshotPath = "" // no snapshot — fall back to standard bootstrap
+		if fi, err := os.Stat(snapshotPath); err != nil || fi.Size() < 1024 {
+			snapshotPath = "" // missing or too small — fall back to standard bootstrap
 		}
 
 		bootstrapper := talos.NewBootstrapper(flagBackupDir)
@@ -238,6 +245,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		if err := state.Save(stateFile); err != nil {
 			return fmt.Errorf("saving state: %w", err)
 		}
+
+		// Apply backed-up Kubernetes resources to the new cluster.
+		// This is the primary restore path when etcd recovery failed or was
+		// skipped; it also acts as a safety net after a successful etcd restore
+		// (idempotent — objects that already exist are left unchanged).
+		applyResourcesFromBackup(filepath.Join(flagBackupDir, "resources"), kubeconfigOut)
 	} else {
 		ui.PrintPhaseSkipped(5, "BOOTSTRAP", "already completed")
 	}
@@ -245,6 +258,58 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	// ─── Done ────────────────────────────────────────────────────────────────
 	printMigrationSuccess(state)
 	return nil
+}
+
+// applyResourcesFromBackup applies the YAML files saved during the collect
+// phase to the new Talos cluster.  It retries for up to 3 minutes to give the
+// Kubernetes API server time to become fully ready after bootstrap.
+// Errors are non-fatal — a warning is printed but migration still succeeds.
+func applyResourcesFromBackup(resourcesDir, kubeconfig string) {
+	if _, err := os.Stat(resourcesDir); err != nil {
+		return // no backup directory
+	}
+	kubectlPath, err := exec.LookPath("kubectl")
+	if err != nil {
+		color.Yellow("  Note: kubectl not found in PATH; skipping resource restore from backup.\n")
+		color.Yellow("  To restore manually: kubectl apply -f %s --recursive\n", resourcesDir)
+		return
+	}
+
+	fmt.Printf("  Applying backed-up resources from %s (retrying up to 3 min)...\n", resourcesDir)
+
+	deadline := time.Now().Add(3 * time.Minute)
+	wait := 5 * time.Second
+	for time.Now().Before(deadline) {
+		var out bytes.Buffer
+		cmd := exec.Command(kubectlPath,
+			"--kubeconfig", kubeconfig,
+			"apply",
+			"-f", resourcesDir,
+			"--recursive",
+		)
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+
+		if err := cmd.Run(); err == nil {
+			color.Green("  ✓ Backed-up resources applied to Talos cluster\n")
+			return
+		}
+
+		outStr := strings.TrimSpace(out.String())
+		// If it's just "no objects passed to apply" the directory has no YAML —
+		// that's not an error worth retrying.
+		if strings.Contains(outStr, "no objects passed to apply") ||
+			strings.Contains(outStr, "the path") {
+			color.Yellow("  Note: no resources found in %s to apply.\n", resourcesDir)
+			return
+		}
+		time.Sleep(wait)
+		if wait < 30*time.Second {
+			wait *= 2
+		}
+	}
+	color.Yellow("  Warning: could not apply backed-up resources within 3 minutes.\n")
+	color.Yellow("  To restore manually: kubectl apply -f %s --recursive\n", resourcesDir)
 }
 
 func printMigrationSuccess(state *MigrationState) {

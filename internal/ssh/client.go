@@ -214,12 +214,13 @@ func (c *Client) sftpDownload(remotePath, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("creating local file %s: %w", localPath, err)
 	}
-	defer dst.Close()
 
 	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(localPath) // remove partial file so callers cannot mistake it for a complete download
 		return fmt.Errorf("downloading %s: %w", remotePath, err)
 	}
-	return nil
+	return dst.Close()
 }
 
 // sftpUpload copies a local file to a remote path via SFTP.

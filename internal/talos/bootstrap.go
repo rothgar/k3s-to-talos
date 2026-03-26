@@ -72,26 +72,44 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	}
 
 	// Step 3: Initialize etcd.
-	// If a k3s etcd snapshot is available, use bootstrap --recover-from to
-	// seed the cluster from the k3s data.
-	// Otherwise, perform a standard bootstrap.
+	// If a k3s etcd snapshot is available, attempt bootstrap --recover-from to
+	// seed the cluster from the k3s data.  If recovery fails (e.g. incompatible
+	// snapshot, partial file, CA mismatch) fall back to a fresh bootstrap so
+	// the migration can still complete; YAML-backed resources will be re-applied
+	// by the caller.
 	// NOTE: talosctl v1.10+ removed 'etcd recover'; recovery is now done via
 	// 'bootstrap --recover-from <snapshot>'.
 	if opts.EtcdSnapshotPath != "" {
 		fmt.Printf("  Bootstrapping etcd from k3s snapshot: %s\n", opts.EtcdSnapshotPath)
-		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+		recoveryErr := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
 			"bootstrap",
 			"--nodes", opts.Host,
 			"--endpoints", opts.Host,
 			"--recover-from", opts.EtcdSnapshotPath,
-		); err != nil {
-			if !strings.Contains(err.Error(), "already bootstrapped") &&
-				!strings.Contains(err.Error(), "AlreadyExists") {
-				return fmt.Errorf("bootstrapping with etcd recovery: %w", err)
-			}
+		)
+		switch {
+		case recoveryErr == nil:
+			color.Green("  ✓ etcd bootstrapped from k3s snapshot\n")
+		case strings.Contains(recoveryErr.Error(), "already bootstrapped"),
+			strings.Contains(recoveryErr.Error(), "AlreadyExists"):
 			fmt.Println("  (cluster was already bootstrapped)")
+		default:
+			// Recovery failed — warn and fall back to a standard fresh bootstrap.
+			color.Yellow("  Warning: etcd recovery failed: %v\n", recoveryErr)
+			color.Yellow("  Falling back to fresh bootstrap (k8s resources will be re-applied from backup).\n")
+			if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+				"bootstrap",
+				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
+			); err != nil {
+				if !strings.Contains(err.Error(), "already bootstrapped") &&
+					!strings.Contains(err.Error(), "AlreadyExists") {
+					return fmt.Errorf("bootstrapping cluster (after recovery failure): %w", err)
+				}
+				fmt.Println("  (cluster was already bootstrapped)")
+			}
+			color.Green("  ✓ Cluster bootstrapped (fresh — etcd recovery was skipped)\n")
 		}
-		color.Green("  ✓ etcd bootstrapped from k3s snapshot\n")
 	} else {
 		fmt.Println("  Bootstrapping Kubernetes cluster (this runs once on the control plane)...")
 		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
