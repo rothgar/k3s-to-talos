@@ -212,27 +212,6 @@ jobs:
             sleep 5
           done
 
-      # ── Set up root SSH via the default user (more reliable than user-data) ────
-      - name: Set up root SSH access
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-          USER="${{ matrix.ssh_user }}@$INSTANCE_IP"
-
-          # Copy CI key into root's authorized_keys via sudo.
-          cat "$HOME/.ssh/ci_key.pub" | ssh $SSH_OPTS "$USER" \
-            "sudo mkdir -p /root/.ssh && \
-             sudo tee -a /root/.ssh/authorized_keys > /dev/null && \
-             sudo chmod 700 /root/.ssh && \
-             sudo chmod 600 /root/.ssh/authorized_keys"
-
-          # Ensure PermitRootLogin allows key-based login.
-          ssh $SSH_OPTS "$USER" \
-            "sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config; \
-             sudo systemctl restart sshd 2>/dev/null || sudo service sshd restart"
-
-          # Verify root SSH works.
-          ssh $SSH_OPTS "root@$INSTANCE_IP" "echo root-ssh-ok"
-
       - name: Wait for cloud-init to complete
         run: |
           # cloud-init runs user-data asynchronously; wait for it to finish
@@ -248,8 +227,9 @@ jobs:
         run: |
           ./k3s-to-talos collect \
             --host "$INSTANCE_IP" \
-            --ssh-user root \
+            --ssh-user "${{ matrix.ssh_user }}" \
             --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
             --backup-dir ./test-backup
 
       # ── Assert backup contents ───────────────────────────────────────────────

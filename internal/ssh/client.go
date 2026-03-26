@@ -22,6 +22,7 @@ type Options struct {
 	Port    int
 	User    string
 	KeyPath string
+	Sudo    bool // prefix privileged commands with sudo (for non-root users)
 }
 
 // Client wraps an SSH connection and provides helpers for remote execution
@@ -69,6 +70,14 @@ func (c *Client) Close() {
 	}
 }
 
+// sudoWrap prepends "sudo " to a command when the Sudo option is set.
+func (c *Client) sudoWrap(cmd string) string {
+	if c.opts.Sudo {
+		return "sudo " + cmd
+	}
+	return cmd
+}
+
 // Run executes a command on the remote machine and returns its combined output.
 func (c *Client) Run(cmd string) (string, error) {
 	sess, err := c.client.NewSession()
@@ -77,7 +86,7 @@ func (c *Client) Run(cmd string) (string, error) {
 	}
 	defer sess.Close()
 
-	out, err := sess.CombinedOutput(cmd)
+	out, err := sess.CombinedOutput(c.sudoWrap(cmd))
 	if err != nil {
 		return string(out), fmt.Errorf("running %q: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
 	}
@@ -95,7 +104,7 @@ func (c *Client) RunStream(cmd string, stdout, stderr io.Writer) error {
 	sess.Stdout = stdout
 	sess.Stderr = stderr
 
-	return sess.Run(cmd)
+	return sess.Run(c.sudoWrap(cmd))
 }
 
 // RunIgnoreError executes a command and returns output, suppressing non-zero exit codes.
@@ -110,8 +119,75 @@ func (c *Client) FileExists(path string) bool {
 	return err == nil && strings.TrimSpace(out) == "yes"
 }
 
-// Download copies a remote file to a local destination via SFTP.
+// Download copies a remote file to a local destination.
+// When Sudo is enabled, the file is first staged to a world-readable temp
+// path so that SFTP (which runs as the SSH user) can access it.
 func (c *Client) Download(remotePath, localPath string) error {
+	if !c.opts.Sudo {
+		return c.sftpDownload(remotePath, localPath)
+	}
+
+	tmp := fmt.Sprintf("/tmp/.k3sto-%d", time.Now().UnixNano())
+	if _, err := c.Run(fmt.Sprintf("cp %q %q", remotePath, tmp)); err != nil {
+		return fmt.Errorf("staging %s for download: %w", remotePath, err)
+	}
+	if _, err := c.Run(fmt.Sprintf("chmod 644 %q", tmp)); err != nil {
+		c.RunIgnoreError(fmt.Sprintf("rm -f %q", tmp))
+		return fmt.Errorf("chmod staging file: %w", err)
+	}
+	defer c.RunIgnoreError(fmt.Sprintf("rm -f %q", tmp))
+	return c.sftpDownload(tmp, localPath)
+}
+
+// Upload copies a local file to a remote path via SFTP.
+// When Sudo is enabled, the file is first uploaded to /tmp then moved into place.
+func (c *Client) Upload(localPath, remotePath string) error {
+	if !c.opts.Sudo {
+		return c.sftpUpload(localPath, remotePath)
+	}
+
+	tmp := fmt.Sprintf("/tmp/.k3sto-%d", time.Now().UnixNano())
+	if err := c.sftpUpload(localPath, tmp); err != nil {
+		return err
+	}
+	_, err := c.Run(fmt.Sprintf("mv %q %q", tmp, remotePath))
+	return err
+}
+
+// UploadBytes writes the given content to a remote path via SFTP.
+// When Sudo is enabled, content is first written to /tmp then moved into place.
+func (c *Client) UploadBytes(content []byte, remotePath string) error {
+	if !c.opts.Sudo {
+		return c.sftpUploadBytes(content, remotePath)
+	}
+
+	tmp := fmt.Sprintf("/tmp/.k3sto-%d", time.Now().UnixNano())
+	if err := c.sftpUploadBytes(content, tmp); err != nil {
+		return err
+	}
+	_, err := c.Run(fmt.Sprintf("mv %q %q", tmp, remotePath))
+	return err
+}
+
+// IsDisconnectError returns true if the error indicates an SSH connection drop
+// (expected when the remote machine reboots).
+func IsDisconnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "use of closed network connection")
+}
+
+// sftpDownload downloads a remote file to a local path via SFTP.
+func (c *Client) sftpDownload(remotePath, localPath string) error {
 	sc, err := sftp.NewClient(c.client)
 	if err != nil {
 		return fmt.Errorf("opening SFTP session: %w", err)
@@ -140,8 +216,8 @@ func (c *Client) Download(remotePath, localPath string) error {
 	return nil
 }
 
-// Upload copies a local file to a remote path via SFTP.
-func (c *Client) Upload(localPath, remotePath string) error {
+// sftpUpload copies a local file to a remote path via SFTP.
+func (c *Client) sftpUpload(localPath, remotePath string) error {
 	sc, err := sftp.NewClient(c.client)
 	if err != nil {
 		return fmt.Errorf("opening SFTP session: %w", err)
@@ -166,8 +242,8 @@ func (c *Client) Upload(localPath, remotePath string) error {
 	return nil
 }
 
-// UploadBytes writes the given content to a remote path via SFTP.
-func (c *Client) UploadBytes(content []byte, remotePath string) error {
+// sftpUploadBytes writes content to a remote path via SFTP.
+func (c *Client) sftpUploadBytes(content []byte, remotePath string) error {
 	sc, err := sftp.NewClient(c.client)
 	if err != nil {
 		return fmt.Errorf("opening SFTP session: %w", err)
@@ -184,23 +260,6 @@ func (c *Client) UploadBytes(content []byte, remotePath string) error {
 		return fmt.Errorf("uploading to %s: %w", remotePath, err)
 	}
 	return nil
-}
-
-// IsDisconnectError returns true if the error indicates an SSH connection drop
-// (expected when the remote machine reboots).
-func IsDisconnectError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "EOF") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "use of closed network connection")
 }
 
 // buildAuthMethods constructs SSH auth methods: key-based first, password fallback.

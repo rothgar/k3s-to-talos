@@ -72,6 +72,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			Port:    flagSSHPort,
 			User:    flagSSHUser,
 			KeyPath: flagSSHKey,
+			Sudo:    flagSudo,
 		})
 		if err != nil {
 			return fmt.Errorf("SSH connection failed: %w", err)
@@ -174,6 +175,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			Port:    flagSSHPort,
 			User:    flagSSHUser,
 			KeyPath: flagSSHKey,
+			Sudo:    flagSudo,
 		})
 		if err != nil {
 			return fmt.Errorf("reconnecting via SSH: %w", err)

@@ -11,6 +11,7 @@ var (
 	flagSSHKey    string
 	flagSSHPort   int
 	flagBackupDir string
+	flagSudo      bool
 )
 
 var rootCmd = &cobra.Command{
@@ -40,6 +41,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagSSHKey, "ssh-key", "", "Path to SSH private key (defaults to ~/.ssh/id_rsa)")
 	rootCmd.PersistentFlags().IntVar(&flagSSHPort, "ssh-port", 22, "SSH port")
 	rootCmd.PersistentFlags().StringVar(&flagBackupDir, "backup-dir", "./k3s-backup", "Local directory for backups and generated configs")
+	rootCmd.PersistentFlags().BoolVar(&flagSudo, "sudo", false, "Prefix remote commands with sudo (for non-root SSH users)")
 
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(collectCmd)
