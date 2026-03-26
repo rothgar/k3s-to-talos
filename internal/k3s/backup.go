@@ -105,19 +105,37 @@ func (b *Backup) backupDatabase(info *ClusterInfo, dbDir string) error {
 func (b *Backup) backupK3sEtcd(dbDir string) error {
 	snapshotName := fmt.Sprintf("migration-backup-%d", time.Now().Unix())
 
-	// Trigger snapshot on remote
-	_, err := b.ssh.Run(fmt.Sprintf("k3s etcd-snapshot save --name %s 2>&1", snapshotName))
+	// Trigger snapshot on remote; capture output so we can parse the written path.
+	saveOut, err := b.ssh.Run(fmt.Sprintf("k3s etcd-snapshot save --name %s 2>&1", snapshotName))
 	if err != nil {
 		return fmt.Errorf("taking etcd snapshot: %w", err)
 	}
 
-	// Find the snapshot file
-	snapshotPath, err := b.ssh.Run(
-		fmt.Sprintf("find /var/lib/rancher/k3s/server/db/snapshots -name '%s*' 2>/dev/null | head -1", snapshotName))
-	if err != nil || strings.TrimSpace(snapshotPath) == "" {
+	// Try to parse the snapshot path from the command output first.
+	// k3s prints a line like:
+	//   Writing etcd snapshot to /var/lib/rancher/k3s/server/db/snapshots/on-demand-<name>-<rev>
+	var snapshotPath string
+	for _, line := range strings.Split(saveOut, "\n") {
+		if idx := strings.Index(line, "/var/lib/rancher/k3s/server/db/snapshots/"); idx != -1 {
+			snapshotPath = strings.TrimSpace(line[idx:])
+			break
+		}
+	}
+
+	// Fall back to a directory search using a wildcard that handles the
+	// "on-demand-" prefix that k3s v1.26+ prepends to manually-triggered snapshots.
+	if snapshotPath == "" {
+		found, err := b.ssh.Run(
+			fmt.Sprintf("find /var/lib/rancher/k3s/server/db/snapshots -name '*%s*' 2>/dev/null | head -1", snapshotName))
+		if err == nil && strings.TrimSpace(found) != "" {
+			snapshotPath = strings.TrimSpace(found)
+		}
+	}
+
+	// Last resort: construct the legacy path (k3s < v1.26 style).
+	if snapshotPath == "" {
 		snapshotPath = fmt.Sprintf("/var/lib/rancher/k3s/server/db/snapshots/%s", snapshotName)
 	}
-	snapshotPath = strings.TrimSpace(snapshotPath)
 
 	localPath := filepath.Join(dbDir, "etcd-snapshot.db")
 	if err := b.ssh.Download(snapshotPath, localPath); err != nil {

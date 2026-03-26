@@ -187,6 +187,17 @@ jobs:
           $SSH "sudo k3s kubectl create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
           $SSH "sudo k3s kubectl get deployment ci-test-nginx"
 
+      # ── Verify etcd is running and snapshots dir exists ──────────────────
+      - name: Check k3s etcd state
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$K3S_IP"
+          echo "=== k3s etcd member dir ==="
+          $SSH "sudo ls -la /var/lib/rancher/k3s/server/db/etcd/member 2>/dev/null || echo 'member dir not found'"
+          echo "=== k3s snapshots dir ==="
+          $SSH "sudo ls -la /var/lib/rancher/k3s/server/db/snapshots/ 2>/dev/null || echo 'snapshots dir not found'"
+          echo "=== k3s etcd-snapshot list ==="
+          $SSH "sudo k3s etcd-snapshot list 2>&1" || true
+
       # ── Collect k3s backup ────────────────────────────────────────────────
       - name: Run collect
         run: |
