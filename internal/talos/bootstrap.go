@@ -2,10 +2,8 @@ package talos
 
 import (
 	"bytes"
-	"crypto/tls"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -133,33 +131,31 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 }
 
 // waitForTalosAPI polls the Talos machine API (port 50000) until it responds,
-// with exponential backoff up to ~10 minutes total.
+// with exponential backoff up to ~20 minutes total.
+//
+// We use a plain TCP dial rather than an HTTPS GET because the Talos API
+// server speaks gRPC (HTTP/2) over TLS.  An HTTP/1.1 GET causes the TLS
+// handshake to succeed but the server immediately returns an error frame,
+// which http.Client may surface as an error even though the port IS open.
+// A successful TCP three-way handshake is sufficient to confirm Talos is up.
 func (b *Bootstrapper) waitForTalosAPI(host string) error {
 	s := spinner.New(spinner.CharSets[14], 200*time.Millisecond)
 	s.Suffix = " Waiting for Talos to boot (this may take several minutes)..."
 	s.Start()
 	defer s.Stop()
 
-	//nolint:gosec // We intentionally skip TLS verification for the initial API check
-	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	url := fmt.Sprintf("https://%s:50000", host)
+	addr := fmt.Sprintf("%s:50000", host)
 	deadline := time.Now().Add(20 * time.Minute)
 	wait := 5 * time.Second
 	start := time.Now()
 	sshChecked := false
 
 	for time.Now().Before(deadline) {
-		resp, err := httpClient.Get(url)
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err == nil {
-			resp.Body.Close()
+			conn.Close()
 			s.Stop()
-			color.Green("  ✓ Talos API is responding at %s\n", url)
+			color.Green("  ✓ Talos API is responding at %s\n", addr)
 			return nil
 		}
 
@@ -203,7 +199,7 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 			"The machine may need manual intervention. Once Talos is running you can:\n"+
 			"  talosctl --talosconfig %s apply-config --insecure --nodes %s --file controlplane.yaml\n"+
 			"  talosctl --talosconfig %s bootstrap --nodes %s\n",
-		url, b.backupDir+"/talos-config/talosconfig", host,
+		addr, b.backupDir+"/talos-config/talosconfig", host,
 		b.backupDir+"/talos-config/talosconfig", host,
 	)
 }

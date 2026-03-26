@@ -574,6 +574,11 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 		return fmt.Errorf("creating EFI/ubuntu: %w", err)
 	}
 
+	// List EFI partition contents for diagnostics.
+	if out, err := exec.Command("find", mountPoint, "-type", "f").CombinedOutput(); err == nil {
+		log("EFI partition files:\n%s", strings.TrimSpace(string(out)))
+	}
+
 	// Copy to all common Ubuntu EFI paths so any NVRAM variant is covered.
 	destinations := []string{
 		filepath.Join(ubuntuDir, "shimx64.efi"),
@@ -591,6 +596,56 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 	}
 	if copied == 0 {
 		return fmt.Errorf("could not write any EFI files to EFI/ubuntu/")
+	}
+
+	// ── grub.cfg chainload stubs ──────────────────────────────────────────
+	// When GRUB is loaded from EFI/ubuntu/shimx64.efi its $cmdpath is
+	// /EFI/ubuntu/, so it searches for grub.cfg there rather than in
+	// EFI/BOOT/grub/.  Create stub configs that redirect to the real
+	// Talos grub.cfg so GRUB finds its configuration.
+	//
+	// We probe several candidate locations and use the first one that exists.
+	grubCfgCandidates := []string{
+		"/EFI/BOOT/grub/grub.cfg",
+		"/EFI/BOOT/grub.cfg",
+		"/boot/grub/grub.cfg",
+		"/EFI/talos/grub.cfg",
+	}
+	realCfgPath := ""
+	for _, rel := range grubCfgCandidates {
+		if _, err := os.Stat(filepath.Join(mountPoint, filepath.FromSlash(rel))); err == nil {
+			realCfgPath = rel
+			log("Found Talos grub.cfg at %s", rel)
+			break
+		}
+	}
+	if realCfgPath == "" {
+		// Log all .cfg files for future debugging.
+		if out, err := exec.Command("find", mountPoint, "-name", "*.cfg").CombinedOutput(); err == nil {
+			log("grub.cfg not found at known paths; .cfg files on EFI partition:\n%s", strings.TrimSpace(string(out)))
+		}
+		// Fall back: point at the most common Talos location even if we
+		// didn't find it (maybe the mount itself is slightly off).
+		realCfgPath = "/EFI/BOOT/grub/grub.cfg"
+		log("Warning: grub.cfg not found; stub will point to %s (best guess)", realCfgPath)
+	}
+
+	stubContent := fmt.Sprintf("configfile %s\n", realCfgPath)
+	stubPaths := []string{
+		filepath.Join(ubuntuDir, "grub.cfg"),
+		filepath.Join(ubuntuDir, "grub", "grub.cfg"),
+	}
+	for _, stubPath := range stubPaths {
+		if err := os.MkdirAll(filepath.Dir(stubPath), 0755); err != nil {
+			log("Warning: could not create dir for grub.cfg stub %s: %v", stubPath, err)
+			continue
+		}
+		if err := os.WriteFile(stubPath, []byte(stubContent), 0644); err != nil {
+			log("Warning: could not write grub.cfg stub %s: %v", stubPath, err)
+		} else {
+			log("Created grub.cfg stub → %s (chainloads %s)",
+				strings.TrimPrefix(stubPath, mountPoint), realCfgPath)
+		}
 	}
 
 	exec.Command("sync").Run() //nolint:errcheck
@@ -696,6 +751,11 @@ func updateUEFIBoot(disk string) error {
 		return fmt.Errorf("installing efibootmgr: %w", err)
 	}
 
+	// Log current NVRAM state before making changes.
+	if out, err := exec.Command("efibootmgr", "-v").CombinedOutput(); err == nil {
+		log("NVRAM before efibootmgr changes:\n%s", strings.TrimSpace(string(out)))
+	}
+
 	// Talos always places its GRUB EFI binary on partition 1 of the metal image.
 	// We construct the DevicePath pointing to it and store it in NVRAM.
 	out, err := exec.Command("efibootmgr",
@@ -723,6 +783,11 @@ func updateUEFIBoot(disk string) error {
 		return fmt.Errorf("efibootmgr --bootnext %s: %w\n%s", bootNum, err, string(out2))
 	}
 	log("UEFI BootNext → Boot%s (Talos will boot immediately on next restart).", bootNum)
+
+	// Log NVRAM state after changes for diagnostics.
+	if out3, err := exec.Command("efibootmgr", "-v").CombinedOutput(); err == nil {
+		log("NVRAM after efibootmgr changes:\n%s", strings.TrimSpace(string(out3)))
+	}
 
 	return nil
 }
