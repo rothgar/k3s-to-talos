@@ -73,20 +73,26 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	}
 
 	// Step 3: Initialize etcd.
-	// If a k3s etcd snapshot is available, use etcd recover to seed the
-	// cluster from the k3s data (replaces talosctl bootstrap).
+	// If a k3s etcd snapshot is available, use bootstrap --recover-from to
+	// seed the cluster from the k3s data.
 	// Otherwise, perform a standard bootstrap.
+	// NOTE: talosctl v1.10+ removed 'etcd recover'; recovery is now done via
+	// 'bootstrap --recover-from <snapshot>'.
 	if opts.EtcdSnapshotPath != "" {
-		fmt.Printf("  Restoring etcd from k3s snapshot: %s\n", opts.EtcdSnapshotPath)
+		fmt.Printf("  Bootstrapping etcd from k3s snapshot: %s\n", opts.EtcdSnapshotPath)
 		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
-			"etcd", "recover",
+			"bootstrap",
 			"--nodes", opts.Host,
 			"--endpoints", opts.Host,
-			"-f", opts.EtcdSnapshotPath,
+			"--recover-from", opts.EtcdSnapshotPath,
 		); err != nil {
-			return fmt.Errorf("restoring etcd from snapshot: %w", err)
+			if !strings.Contains(err.Error(), "already bootstrapped") &&
+				!strings.Contains(err.Error(), "AlreadyExists") {
+				return fmt.Errorf("bootstrapping with etcd recovery: %w", err)
+			}
+			fmt.Println("  (cluster was already bootstrapped)")
 		}
-		color.Green("  ✓ etcd restored from k3s snapshot\n")
+		color.Green("  ✓ etcd bootstrapped from k3s snapshot\n")
 	} else {
 		fmt.Println("  Bootstrapping Kubernetes cluster (this runs once on the control plane)...")
 		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
@@ -115,6 +121,7 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		"kubeconfig",
 		"--nodes", opts.Host,
 		"--force",
+		"--merge=false",
 		opts.KubeconfigOut,
 	); err != nil {
 		return fmt.Errorf("retrieving kubeconfig: %w", err)

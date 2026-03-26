@@ -60,7 +60,7 @@ func (i *Installer) Run(opts Options) error {
 		s.Stop()
 		color.Yellow("  Warning: could not resolve image URL (%v); using amd64 default.\n", err)
 		imageURL = fmt.Sprintf(
-			"https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4b/%s/metal-amd64.raw.zst",
+			"https://factory.talos.dev/image/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba/%s/metal-amd64.raw.zst",
 			opts.TalosVersion,
 		)
 		imageHash = ""
