@@ -170,7 +170,7 @@ func streamImageToDisk(imageURL, imageHash, disk string) error {
 
 	switch {
 	case strings.HasSuffix(imageURL, ".zst"):
-		err = runDecompressorToDisk(src, disk, "zstd", "-d", "-", "-o", disk, "-f")
+		err = runDecompressorStdoutToDisk(src, disk, "zstd", "-d", "-", "-c")
 	case strings.HasSuffix(imageURL, ".xz"):
 		// xz writes decompressed output to stdout; pipe that to the disk.
 		err = runDecompressorStdoutToDisk(src, disk, "xz", "-d", "-c", "-")

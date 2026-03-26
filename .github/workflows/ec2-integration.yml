@@ -28,7 +28,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go build -o k3s-to-talos .
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o k3s-to-talos .
       - uses: actions/upload-artifact@v4
         with:
           name: k3s-to-talos-binary
