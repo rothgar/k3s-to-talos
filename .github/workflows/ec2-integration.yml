@@ -3,7 +3,7 @@ name: EC2 Integration Tests
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["main", "claude/**"]
   pull_request:
     branches: ["main"]
 
