@@ -80,7 +80,19 @@ func Run(opts Options) error {
 	}
 	log("Disk write complete.")
 
-	// ── 4. Write machine config to STATE partition ───────────────────────────
+	// ── 4. Update UEFI NVRAM so Talos is the next boot target ───────────────
+	// On UEFI systems the NVRAM still has the old OS's boot entry.  After the
+	// disk is overwritten that entry points to a file that no longer exists.
+	// UEFI will eventually fall back to \EFI\BOOT\BOOTX64.EFI (where Talos
+	// puts its bootloader), but some firmware implementations (including EC2's)
+	// can take 5+ minutes to try the fallback.  Using efibootmgr to set
+	// BootNext removes the delay and makes the next boot deterministic.
+	if err := updateUEFIBoot(disk); err != nil {
+		log("Warning: could not update UEFI boot entry: %v", err)
+		log("Talos will still boot via UEFI fallback (may take a few extra minutes).")
+	}
+
+	// ── 5. Write machine config to STATE partition ───────────────────────────
 	if opts.Config != "" {
 		configData, err := os.ReadFile(opts.Config)
 		if err != nil {
@@ -96,7 +108,7 @@ func Run(opts Options) error {
 	log("═══════════════════════════════════════════════════════════")
 	log("Talos installation complete.")
 
-	// ── 5. Reboot ────────────────────────────────────────────────────────────
+	// ── 6. Reboot ────────────────────────────────────────────────────────────
 	if opts.Reboot {
 		log("Rebooting into Talos Linux...")
 		time.Sleep(2 * time.Second)
@@ -286,6 +298,56 @@ func writeConfig(disk string, config []byte) error {
 	}
 	return fmt.Errorf("could not mount STATE partition (tried: %s)",
 		strings.Join(candidates, ", "))
+}
+
+// ── UEFI boot entry management ───────────────────────────────────────────────
+
+// updateUEFIBoot uses efibootmgr to add a Talos boot entry and set it as
+// BootNext so the machine boots directly into Talos on the next restart,
+// rather than waiting for the firmware to time out on the missing old-OS entry.
+//
+// This is a best-effort operation: if efivarfs is not mounted (BIOS system)
+// or efibootmgr fails, the machine will still boot via UEFI fallback.
+func updateUEFIBoot(disk string) error {
+	// Only meaningful on UEFI systems.
+	if _, err := os.Stat("/sys/firmware/efi/efivars"); err != nil {
+		log("BIOS system — skipping UEFI boot entry update.")
+		return nil
+	}
+
+	if err := ensureTool("efibootmgr"); err != nil {
+		return fmt.Errorf("installing efibootmgr: %w", err)
+	}
+
+	// Talos always places its GRUB EFI binary on partition 1 of the metal image.
+	// We construct the DevicePath pointing to it and store it in NVRAM.
+	out, err := exec.Command("efibootmgr",
+		"--create",
+		"--disk", disk,
+		"--part", "1",
+		"--label", "Talos",
+		"--loader", `\EFI\BOOT\BOOTX64.EFI`,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("efibootmgr --create: %w\n%s", err, string(out))
+	}
+
+	// Parse the new entry number from output lines like "Boot000X* Talos"
+	re := regexp.MustCompile(`Boot([0-9A-Fa-f]{4})\*?\s+Talos`)
+	match := re.FindSubmatch(out)
+	if match == nil {
+		return fmt.Errorf("could not find new Talos boot entry in efibootmgr output:\n%s", string(out))
+	}
+	bootNum := string(match[1])
+	log("Created UEFI boot entry Boot%s for Talos.", bootNum)
+
+	// Set BootNext so this entry is used on the next boot (one-shot override).
+	if out2, err := exec.Command("efibootmgr", "--bootnext", bootNum).CombinedOutput(); err != nil {
+		return fmt.Errorf("efibootmgr --bootnext %s: %w\n%s", bootNum, err, string(out2))
+	}
+	log("UEFI BootNext → Boot%s (Talos will boot immediately on next restart).", bootNum)
+
+	return nil
 }
 
 // ── Progress reader ──────────────────────────────────────────────────────────

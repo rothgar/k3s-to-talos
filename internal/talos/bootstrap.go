@@ -148,7 +148,7 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 	}
 
 	url := fmt.Sprintf("https://%s:50000", host)
-	deadline := time.Now().Add(10 * time.Minute)
+	deadline := time.Now().Add(20 * time.Minute)
 	wait := 5 * time.Second
 
 	for time.Now().Before(deadline) {
@@ -177,7 +177,7 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 
 	s.Stop()
 	return fmt.Errorf(
-		"Talos API at %s did not become available within 10 minutes\n\n"+
+		"Talos API at %s did not become available within 20 minutes\n\n"+
 			"The machine may need manual intervention. Once Talos is running you can:\n"+
 			"  talosctl --talosconfig %s apply-config --insecure --nodes %s --file controlplane.yaml\n"+
 			"  talosctl --talosconfig %s bootstrap --nodes %s\n",
