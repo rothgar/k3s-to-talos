@@ -120,8 +120,17 @@ def verify_hash(path, expected_hash):
 
 
 def decompress_if_needed(src_path, tmp_dir):
-    """Decompress .xz or .gz image if necessary. Returns path to raw image."""
-    if src_path.endswith(".xz"):
+    """Decompress .zst, .xz, or .gz image if necessary. Returns path to raw image."""
+    if src_path.endswith(".zst"):
+        log("Decompressing ZST image...")
+        raw_path = os.path.join(tmp_dir, "talos.img")
+        # Ensure zstd is available
+        if shutil.which("zstd") is None:
+            log("zstd not found, installing...")
+            subprocess.run(["apt-get", "install", "-y", "-q", "zstd"], check=True)
+        subprocess.run(["zstd", "-d", src_path, "-o", raw_path, "-f"], check=True)
+        return raw_path
+    elif src_path.endswith(".xz"):
         log("Decompressing XZ image...")
         raw_path = os.path.join(tmp_dir, "talos.img")
         subprocess.run(["xz", "-d", "-k", "-T0", "-o", raw_path, src_path], check=True)

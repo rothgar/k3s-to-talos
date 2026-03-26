@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -137,24 +136,29 @@ func detectRaspberryPi(runner SSHRunner, hw *HardwareInfo) {
 	}
 }
 
-// imageFactorySchematic is the YAML posted to factory.talos.dev for Raspberry Pi 4/5.
+// rpiSchematic is the YAML posted to factory.talos.dev for Raspberry Pi 4/5.
 // The rpi_generic overlay works for both Pi 4 and Pi 5.
-const imageFactorySchematic = `overlays:
+const rpiSchematic = `overlays:
   - name: rpi_generic
     image: siderolabs/sbc-raspberrypi
+`
+
+// defaultSchematic is the YAML posted to factory.talos.dev for generic x86_64/arm64
+// machines that require no custom overlays or extensions.
+const defaultSchematic = `customization: {}
 `
 
 type factoryResponse struct {
 	ID string `json:"id"`
 }
 
-// GetImageFactorySchematicID submits the Raspberry Pi schematic to factory.talos.dev
+// GetImageFactorySchematicID submits the given schematic YAML to factory.talos.dev
 // and returns the content-addressable schematic ID.
-func GetImageFactorySchematicID() (string, error) {
+func GetImageFactorySchematicID(schematicYAML string) (string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	req, err := http.NewRequest(http.MethodPost, "https://factory.talos.dev/schematics",
-		bytes.NewBufferString(imageFactorySchematic))
+		bytes.NewBufferString(schematicYAML))
 	if err != nil {
 		return "", fmt.Errorf("building request: %w", err)
 	}
@@ -186,78 +190,37 @@ func GetImageFactorySchematicID() (string, error) {
 	return r.ID, nil
 }
 
-// ResolveImageURL returns the correct Talos metal disk image URL and its
-// SHA256 checksum for the target hardware and version.
-//
-// For amd64 or plain arm64 (non-Pi): uses the standard GitHub release URL.
-// For Raspberry Pi 4/5: fetches a schematic from factory.talos.dev and builds
-// a custom image URL.
+// ResolveImageURL returns the correct Talos metal disk image URL for the
+// target hardware and version. Always uses factory.talos.dev so the URL
+// format is consistent across all Talos versions.
 func ResolveImageURL(version string, hw *HardwareInfo) (imageURL, hash string, err error) {
-	if hw.NeedsImageFactory() {
-		return resolveFactoryImageURL(version, hw)
-	}
-	return resolveGitHubImageURL(version, hw.Arch)
-}
-
-func resolveGitHubImageURL(version, arch string) (imageURL, hash string, err error) {
-	filename := fmt.Sprintf("metal-%s.raw.xz", arch)
-	imageURL = fmt.Sprintf(
-		"https://github.com/siderolabs/talos/releases/download/%s/%s",
-		version, filename,
-	)
-
-	checksumURL := fmt.Sprintf(
-		"https://github.com/siderolabs/talos/releases/download/%s/sha256sum.txt",
-		version,
-	)
-	hash, err = fetchChecksumForFile(checksumURL, filename)
-	return imageURL, hash, err
+	return resolveFactoryImageURL(version, hw)
 }
 
 func resolveFactoryImageURL(version string, hw *HardwareInfo) (imageURL, hash string, err error) {
 	// Get (or reuse cached) schematic ID.
 	schematicID := hw.ImageFactorySchematicID
 	if schematicID == "" {
-		schematicID, err = GetImageFactorySchematicID()
+		schematic := defaultSchematic
+		if hw.IsRaspberryPi && (hw.PiGen == Pi4 || hw.PiGen == Pi5) {
+			schematic = rpiSchematic
+		}
+		schematicID, err = GetImageFactorySchematicID(schematic)
 		if err != nil {
 			return "", "", fmt.Errorf("getting image factory schematic: %w", err)
 		}
 		hw.ImageFactorySchematicID = schematicID
 	}
 
+	arch := hw.Arch
+	if arch == "" {
+		arch = ArchAMD64
+	}
 	imageURL = fmt.Sprintf(
-		"https://factory.talos.dev/image/%s/%s/metal-arm64.raw.xz",
-		schematicID, version,
+		"https://factory.talos.dev/image/%s/%s/metal-%s.raw.zst",
+		schematicID, version, arch,
 	)
 	// factory.talos.dev does not provide a separate checksum file; skip hash verification.
 	return imageURL, "", nil
 }
 
-// fetchChecksumForFile parses a sha256sum.txt file and returns the hash for targetFile.
-func fetchChecksumForFile(checksumURL, targetFile string) (string, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(checksumURL)
-	if err != nil {
-		return "", fmt.Errorf("fetching checksums from %s: %w", checksumURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetching checksums: HTTP %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading checksums: %w", err)
-	}
-
-	// Format: "<hash>  <filename>" (two spaces between hash and filename).
-	// The filename may be prefixed with "./" so we match the base name.
-	target := regexp.QuoteMeta(targetFile)
-	re := regexp.MustCompile(`([0-9a-f]{64})\s+(?:\./)?` + target)
-	if m := re.FindStringSubmatch(string(body)); len(m) == 2 {
-		return m[1], nil
-	}
-
-	return "", fmt.Errorf("%s not found in checksums file", targetFile)
-}

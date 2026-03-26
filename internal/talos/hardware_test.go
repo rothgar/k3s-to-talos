@@ -191,26 +191,3 @@ func TestNeedsImageFactory(t *testing.T) {
 	}
 }
 
-// ── fetchChecksumForFile ──────────────────────────────────────────────────────
-
-func TestFetchChecksumForFile_ParsesCorrectly(t *testing.T) {
-	// We test the regex matching logic directly via a helper that accepts the
-	// checksum file body as a string (mirroring what fetchChecksumForFile parses).
-	body := `abc123def456  ./metal-amd64.raw.xz
-789xyz          ./metal-arm64.raw.xz
-`
-	// Re-implement the matching logic from fetchChecksumForFile so we can unit
-	// test it without making an HTTP call.
-	target := "metal-amd64.raw.xz"
-	found := ""
-	for _, line := range strings.Split(body, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 2 && strings.HasSuffix(strings.TrimPrefix(fields[1], "./"), target) {
-			found = fields[0]
-			break
-		}
-	}
-	if found != "abc123def456" {
-		t.Errorf("expected abc123def456, got %q", found)
-	}
-}
