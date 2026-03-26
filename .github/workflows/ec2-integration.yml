@@ -204,12 +204,12 @@ jobs:
 
           case "${{ matrix.cluster }}" in
             k3s)     KUBECTL="sudo k3s kubectl" ;;
-            kubeadm) KUBECTL="sudo kubectl" ;;
+            kubeadm) KUBECTL="sudo kubectl --kubeconfig /etc/kubernetes/admin.conf" ;;
           esac
 
           echo "Waiting for cluster to become ready (up to 15 minutes)..."
           for i in $(seq 1 180); do
-            if $SSH "$KUBECTL get nodes 2>/dev/null" | grep -q "Ready"; then
+            if $SSH "$KUBECTL get nodes 2>/dev/null" | grep -q " Ready"; then
               echo "Cluster ready after $((i*5))s"
               break
             fi
@@ -224,7 +224,7 @@ jobs:
 
           case "${{ matrix.cluster }}" in
             k3s)     KUBECTL="sudo k3s kubectl" ;;
-            kubeadm) KUBECTL="sudo kubectl" ;;
+            kubeadm) KUBECTL="sudo kubectl --kubeconfig /etc/kubernetes/admin.conf" ;;
           esac
 
           $SSH "$KUBECTL create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
