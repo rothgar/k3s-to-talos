@@ -78,8 +78,8 @@ kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/d
 kubectl apply -f \
   https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
 
-# Wait for the node to become Ready (up to 5 minutes).
-timeout 300 bash -c \
+# Wait for the node to become Ready (up to 10 minutes).
+timeout 600 bash -c \
   'until kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'
 
 echo "kubeadm installation complete: $(kubelet --version)"

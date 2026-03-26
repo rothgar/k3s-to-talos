@@ -207,13 +207,13 @@ jobs:
             kubeadm) KUBECTL="sudo kubectl --kubeconfig /etc/kubernetes/admin.conf" ;;
           esac
 
-          echo "Waiting for cluster to become ready (up to 15 minutes)..."
-          for i in $(seq 1 180); do
+          echo "Waiting for cluster to become ready (up to 30 minutes)..."
+          for i in $(seq 1 360); do
             if $SSH "$KUBECTL get nodes 2>/dev/null" | grep -q " Ready"; then
               echo "Cluster ready after $((i*5))s"
               break
             fi
-            [ "$i" -eq 180 ] && { echo "Timeout: cluster not ready after 15 minutes"; exit 1; }
+            [ "$i" -eq 360 ] && { echo "Timeout: cluster not ready after 30 minutes"; exit 1; }
             sleep 5
           done
 
