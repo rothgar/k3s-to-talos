@@ -83,8 +83,8 @@ The workflow needs EC2 and SSM read access. Create the inline policy:
         "ssm:GetParameter"
       ],
       "Resource": [
-        "arn:aws:ssm:us-east-1::parameter/aws/service/canonical/ubuntu/*",
-        "arn:aws:ssm:us-east-1::parameter/aws/service/debian/*"
+        "arn:aws:ssm:us-west-2::parameter/aws/service/canonical/ubuntu/*",
+        "arn:aws:ssm:us-west-2::parameter/aws/service/debian/*"
       ]
     },
     {
@@ -111,7 +111,7 @@ The workflow needs EC2 and SSM read access. Create the inline policy:
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1"
+          "aws:RequestedRegion": "us-west-2"
         }
       }
     }
@@ -138,7 +138,7 @@ AWS_VPC_ID     = vpc-xxxxxxxx
 AWS_SUBNET_ID  = subnet-xxxxxxxx
 ```
 
-The subnet must be in **us-east-1** (matches `AWS_REGION` in the workflow) and must
+The subnet must be in **us-west-2** (matches `AWS_REGION` in the workflow) and must
 have **Auto-assign public IPv4** enabled so the runner can SSH to the test instances.
 
 ---
