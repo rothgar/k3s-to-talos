@@ -1,26 +1,17 @@
 package nextboot
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
-	"strings"
-	"text/template"
+	"os/exec"
+	"runtime"
 	"time"
-
-	_ "embed"
 
 	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/ssh"
 	"github.com/rothgar/k3s-to-talos/internal/talos"
 )
-
-//go:embed assets/nextboot-talos.py.tmpl
-var scriptTemplate string
 
 // Options holds parameters for the nextboot-talos installer.
 type Options struct {
@@ -30,7 +21,8 @@ type Options struct {
 	Hardware       *talos.HardwareInfo // detected hardware; nil defaults to amd64
 }
 
-// Installer uploads and runs nextboot-talos on the remote machine.
+// Installer uploads the k3s-to-talos binary to the remote machine and runs
+// the hidden "nextboot" subcommand on it to install Talos in-place.
 type Installer struct {
 	ssh       *ssh.Client
 	backupDir string
@@ -41,17 +33,17 @@ func NewInstaller(sshClient *ssh.Client, backupDir string) *Installer {
 	return &Installer{ssh: sshClient, backupDir: backupDir}
 }
 
-// Run generates, uploads, and executes the nextboot-talos script.
+// Run uploads the binary + machine config and executes the nextboot agent on
+// the remote machine.
 func (i *Installer) Run(opts Options) error {
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 
-	// 1. Resolve the Talos image URL and hash (hardware-aware).
+	// ── 1. Resolve Talos image URL ────────────────────────────────────────────
 	s.Suffix = " Resolving Talos image URL..."
 	s.Start()
 
 	hw := opts.Hardware
 	if hw == nil {
-		// Fallback: assume amd64 if no hardware info was provided.
 		hw = &talos.HardwareInfo{Arch: talos.ArchAMD64}
 	}
 
@@ -68,126 +60,127 @@ func (i *Installer) Run(opts Options) error {
 	s.Stop()
 	fmt.Printf("  Image URL:  %s\n", imageURL)
 	if imageHash != "" {
-		fmt.Printf("  SHA256:     %s\n", imageHash)
+		fmt.Printf("  SHA-256:    %s\n", imageHash)
 	}
 
-	// 2. Read the machine config
-	s.Suffix = " Reading machine config..."
+	// ── 2. Locate the binary to upload ────────────────────────────────────────
+	s.Suffix = " Locating agent binary..."
 	s.Start()
 
-	configContent := ""
+	binaryPath, tmpBinary, err := resolveAgentBinary()
+	if err != nil {
+		s.Stop()
+		return fmt.Errorf("resolving agent binary: %w", err)
+	}
+	if tmpBinary != "" {
+		defer os.Remove(tmpBinary)
+	}
+	s.Stop()
+	fmt.Printf("  Agent binary: %s\n", binaryPath)
+
+	// ── 3. Upload binary ──────────────────────────────────────────────────────
+	s.Suffix = " Uploading nextboot agent binary..."
+	s.Start()
+
+	const remoteBin = "/tmp/k3s-to-talos-nextboot"
+	if err := i.ssh.Upload(binaryPath, remoteBin); err != nil {
+		s.Stop()
+		return fmt.Errorf("uploading agent binary: %w", err)
+	}
+	if _, err := i.ssh.Run(fmt.Sprintf("chmod +x %s", remoteBin)); err != nil {
+		s.Stop()
+		return fmt.Errorf("chmod agent binary: %w", err)
+	}
+	s.Stop()
+	fmt.Printf("  ✓ Binary uploaded to %s\n", remoteBin)
+
+	// ── 4. Upload machine config ──────────────────────────────────────────────
+	const remoteCfg = "/tmp/nextboot-config.yaml"
 	if opts.ConfigFile != "" {
-		data, err := os.ReadFile(opts.ConfigFile)
-		if err != nil {
+		s.Suffix = " Uploading machine config..."
+		s.Start()
+		if err := i.ssh.Upload(opts.ConfigFile, remoteCfg); err != nil {
 			s.Stop()
-			color.Yellow("  Warning: could not read config file %s: %v\n", opts.ConfigFile, err)
+			color.Yellow("  Warning: could not upload config file: %v\n", err)
+			color.Yellow("  Talos will boot in maintenance mode.\n")
 		} else {
-			configContent = string(data)
+			s.Stop()
+			fmt.Printf("  ✓ Machine config uploaded to %s\n", remoteCfg)
 		}
 	}
-	s.Stop()
 
-	// 3. Render the script template
-	script, err := renderScript(scriptParams{
-		Version:       opts.TalosVersion,
-		ImageURL:      imageURL,
-		HashValue:     imageHash,
-		ConfigContent: escapeForPython(configContent),
-		Reboot:        "True",
-	})
-	if err != nil {
-		return fmt.Errorf("rendering nextboot-talos script: %w", err)
-	}
-
-	// 4. Upload script to remote
-	s.Suffix = " Uploading nextboot-talos script..."
-	s.Start()
-
-	remotePath := "/tmp/nextboot-talos.py"
-	if err := i.ssh.UploadBytes([]byte(script), remotePath); err != nil {
-		s.Stop()
-		return fmt.Errorf("uploading nextboot-talos: %w", err)
-	}
-	if _, err := i.ssh.Run(fmt.Sprintf("chmod +x %s", remotePath)); err != nil {
-		s.Stop()
-		return fmt.Errorf("chmod nextboot-talos: %w", err)
-	}
-	s.Stop()
-	fmt.Printf("  ✓ Script uploaded to %s\n", remotePath)
-
-	// 5. Verify python3 is available on remote
-	if _, err := i.ssh.Run("which python3"); err != nil {
-		return fmt.Errorf("python3 not found on remote machine (required by nextboot-talos)\n" +
-			"Install it with: apt-get install -y python3")
-	}
-
-	// 6. Execute the script (streaming output)
-	color.Red("\n  !! POINT OF NO RETURN — executing nextboot-talos !!\n")
+	// ── 5. Execute nextboot agent on the remote ───────────────────────────────
+	color.Red("\n  !! POINT OF NO RETURN — executing nextboot agent !!\n")
 	color.Red("  The remote machine will now be erased and rebooted into Talos.\n\n")
 
+	remoteCmd := fmt.Sprintf("%s nextboot --image-url %q", remoteBin, imageURL)
+	if imageHash != "" {
+		remoteCmd += fmt.Sprintf(" --image-hash %q", imageHash)
+	}
+	if opts.ConfigFile != "" {
+		remoteCmd += fmt.Sprintf(" --config %s", remoteCfg)
+	}
+
 	err = i.ssh.RunStream(
-		fmt.Sprintf("python3 %s 2>&1", remotePath),
+		remoteCmd,
 		newPrefixWriter("  remote> "),
 		newPrefixWriter("  remote> "),
 	)
 
-	// The SSH connection dropping is expected (machine reboots)
+	// SSH disconnect is expected — the machine reboots at the end of the agent.
 	if err != nil && !ssh.IsDisconnectError(err) {
-		return fmt.Errorf("nextboot-talos script failed: %w", err)
+		return fmt.Errorf("nextboot agent failed: %w", err)
 	}
 
 	return nil
 }
 
-// scriptParams holds values to substitute into the Python template.
-type scriptParams struct {
-	Version       string
-	ImageURL      string
-	HashValue     string
-	ConfigContent string
-	Reboot        string
-}
+// resolveAgentBinary returns the path to a Linux amd64 k3s-to-talos binary
+// suitable for uploading to the remote machine.
+//
+// If the current process is already a Linux amd64 binary (the typical CI
+// case), it returns os.Executable().  Otherwise it cross-compiles a fresh
+// binary using `go build`.
+//
+// The second return value is a temp file path that the caller must delete
+// after use (empty string if os.Executable was used).
+func resolveAgentBinary() (path string, tmpPath string, err error) {
+	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		p, err := os.Executable()
+		if err != nil {
+			return "", "", fmt.Errorf("os.Executable: %w", err)
+		}
+		return p, "", nil
+	}
 
-func renderScript(p scriptParams) (string, error) {
-	tmpl, err := template.New("nextboot").Parse(scriptTemplate)
+	// Cross-compile for Linux amd64.
+	color.Yellow("  Note: current binary is %s/%s; cross-compiling for linux/amd64...\n",
+		runtime.GOOS, runtime.GOARCH)
+
+	tmp, err := os.CreateTemp("", "k3s-to-talos-linux-amd64-*")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, p); err != nil {
-		return "", err
+	tmp.Close()
+
+	cmd := exec.Command("go", "build", "-o", tmp.Name(), ".")
+	cmd.Env = append(os.Environ(),
+		"GOOS=linux",
+		"GOARCH=amd64",
+		"CGO_ENABLED=0",
+	)
+	if out, buildErr := cmd.CombinedOutput(); buildErr != nil {
+		os.Remove(tmp.Name())
+		return "", "", fmt.Errorf("cross-compile failed: %w\n%s", buildErr, string(out))
 	}
-	return buf.String(), nil
+
+	return tmp.Name(), tmp.Name(), nil
 }
 
-
-// hashFile computes the SHA256 of a local file.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// escapeForPython escapes a string for embedding in a Python triple-quoted string.
-func escapeForPython(s string) string {
-	// Escape backslashes and triple-quotes
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, `"""`, `\"\"\"`)
-	return s
-}
-
-// prefixWriter is an io.Writer that prepends a string to each line.
+// prefixWriter is an io.Writer that prepends a prefix to every output line.
 type prefixWriter struct {
-	prefix  string
-	buf     []byte
+	prefix string
+	buf    []byte
 }
 
 func newPrefixWriter(prefix string) *prefixWriter {
@@ -197,16 +190,18 @@ func newPrefixWriter(prefix string) *prefixWriter {
 func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 	pw.buf = append(pw.buf, p...)
 	for {
-		idx := bytes.IndexByte(pw.buf, '\n')
+		idx := -1
+		for j, b := range pw.buf {
+			if b == '\n' {
+				idx = j
+				break
+			}
+		}
 		if idx < 0 {
 			break
 		}
-		line := pw.buf[:idx+1]
-		fmt.Printf("%s%s", pw.prefix, line)
+		fmt.Printf("%s%s\n", pw.prefix, pw.buf[:idx])
 		pw.buf = pw.buf[idx+1:]
 	}
 	return len(p), nil
 }
-
-// Ensure hashFile is referenced (it may be used in future verification).
-var _ = hashFile
