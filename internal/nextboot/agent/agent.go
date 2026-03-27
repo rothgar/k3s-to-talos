@@ -372,12 +372,28 @@ func writeReaderToDisk(r io.Reader, disk string) error {
 // superblock for the old partition-4 device may be stale (same root cause
 // that required losetup for the EFI partition).  losetup goes through the
 // /dev/xvda page cache at the correct offset so we always see the new data.
+//
+// The STATE partition uses XFS (Talos v1.8+).  We explicitly load the xfs
+// kernel module before mounting so the mount does not fail on systems where
+// the module is not already loaded.
 func writeConfig(disk string, config []byte) error {
+	// Ensure the XFS kernel module is loaded — Talos STATE partition is XFS.
+	// This is a no-op when already loaded; ignore errors (BIOS-only systems
+	// don't have efivars or the module may be built-in).
+	if out, err := exec.Command("modprobe", "xfs").CombinedOutput(); err != nil {
+		log("modprobe xfs: %v (%s) — continuing anyway", err, strings.TrimSpace(string(out)))
+	}
+
 	loopDev, cleanup, err := losetupStatePartition(disk)
 	if err != nil {
 		return fmt.Errorf("setting up loop device for STATE partition: %w", err)
 	}
 	defer cleanup()
+
+	// Log the filesystem type on the loop device for diagnostics.
+	if out, err := exec.Command("blkid", "-o", "value", "-s", "TYPE", loopDev).Output(); err == nil {
+		log("STATE partition filesystem type: %s", strings.TrimSpace(string(out)))
+	}
 
 	mountPoint, err := os.MkdirTemp("", "talos-state-*")
 	if err != nil {
@@ -385,8 +401,22 @@ func writeConfig(disk string, config []byte) error {
 	}
 	defer os.RemoveAll(mountPoint)
 
-	if out, err := exec.Command("mount", loopDev, mountPoint).CombinedOutput(); err != nil {
-		return fmt.Errorf("mounting STATE loop device %s: %w\n%s", loopDev, err, string(out))
+	// Retry mount up to 3 times — the loop device may not be immediately
+	// ready on kernels with slow uevent processing.
+	var mountErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		var out []byte
+		out, mountErr = exec.Command("mount", loopDev, mountPoint).CombinedOutput()
+		if mountErr == nil {
+			break
+		}
+		log("mount attempt %d/3 failed for %s: %v (%s)", attempt, loopDev, mountErr, strings.TrimSpace(string(out)))
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	if mountErr != nil {
+		return fmt.Errorf("mounting STATE loop device %s after 3 attempts: %w", loopDev, mountErr)
 	}
 	defer exec.Command("umount", mountPoint).Run() //nolint:errcheck
 
@@ -395,7 +425,17 @@ func writeConfig(disk string, config []byte) error {
 		return fmt.Errorf("writing config to %s: %w", configPath, err)
 	}
 	exec.Command("sync").Run() //nolint:errcheck
-	log("Machine config written to STATE partition (%s via %s).", disk+"[STATE]", loopDev)
+
+	// Verify the write by reading the file back.
+	written, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("verifying config write (read-back failed): %w", err)
+	}
+	if len(written) != len(config) {
+		return fmt.Errorf("config write verification failed: wrote %d bytes but read back %d bytes", len(config), len(written))
+	}
+	log("Machine config written and verified on STATE partition (%s via %s, %d bytes).",
+		disk+"[STATE]", loopDev, len(config))
 	return nil
 }
 

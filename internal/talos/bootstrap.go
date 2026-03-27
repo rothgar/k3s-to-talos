@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -236,16 +237,27 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 // applied the machine config and is ready for authenticated API calls like
 // "bootstrap".  This prevents a race condition where the TCP port opens before
 // machined has loaded its TLS identity from the config.
+//
+// Each iteration also checks port 50000 TCP state to distinguish:
+//   - Port UP + cert error  → Talos is in maintenance mode (self-signed cert)
+//   - Port DOWN             → machine is rebooting (expected after apply-config)
+//
+// If port 50000 has been continuously reachable for >5 minutes with persistent
+// cert failures, apply-config is retried in case the first attempt was dropped.
 func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host string) error {
 	s := spinner.New(spinner.CharSets[14], 200*time.Millisecond)
 	s.Suffix = " Waiting for Talos gRPC API (CA-verified)..."
 	s.Start()
 	defer s.Stop()
 
-	deadline := time.Now().Add(20 * time.Minute)
+	deadline := time.Now().Add(35 * time.Minute)
 	wait := 5 * time.Second
 	start := time.Now()
 	attempt := 0
+	// Track how long port 50000 has been continuously UP with a cert failure.
+	// If >5 min, re-send apply-config — the first one may have been lost.
+	var port50kUpSince time.Time
+	applyConfigRetried := false
 
 	for time.Now().Before(deadline) {
 		attempt++
@@ -263,16 +275,66 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host 
 			return nil
 		}
 
-		// Log the actual error every few attempts so CI logs are informative.
-		if attempt == 1 || attempt%5 == 0 {
+		// Check port 50000 TCP state — this tells us what phase we're in.
+		port50kUp := false
+		if conn, tcpErr := net.DialTimeout("tcp", host+":50000", 3*time.Second); tcpErr == nil {
+			conn.Close()
+			port50kUp = true
+		}
+
+		// Log the actual error every attempt for the first 5, then every 5th.
+		if attempt <= 5 || attempt%5 == 0 {
 			s.Stop()
-			color.Yellow("  [attempt %d] talosctl version: %v\n", attempt, err)
+			portState := "DOWN (rebooting)"
+			if port50kUp {
+				portState = "UP (maintenance mode / cert mismatch)"
+			}
+			color.Yellow("  [attempt %d, elapsed %s] port 50000: %s\n    talosctl error: %v\n",
+				attempt, time.Since(start).Round(time.Second), portState, err)
 			s.Start()
+		}
+
+		// Track consecutive time port 50000 has been UP with cert failure.
+		if port50kUp {
+			if port50kUpSince.IsZero() {
+				port50kUpSince = time.Now()
+			}
+			// If port has been UP (maintenance mode) for >5 min and we
+			// haven't retried yet, re-send apply-config — the first may
+			// have been silently dropped or Talos rejected it.
+			if !applyConfigRetried && time.Since(port50kUpSince) > 5*time.Minute {
+				applyConfigRetried = true
+				s.Stop()
+				color.Yellow("  Port 50000 has been up for >5 min with cert errors — " +
+					"retrying apply-config --insecure\n")
+				s.Start()
+				// Read controlplane.yaml path from BootstrapOptions — we need
+				// the stored path. Re-derive it from talosConfigFile directory.
+				controlPlaneCfg := filepath.Join(filepath.Dir(talosConfigFile), "controlplane.yaml")
+				if applyErr := b.runTalosctl(talosctlPath, talosConfigFile,
+					"apply-config", "--insecure",
+					"--nodes", host,
+					"--file", controlPlaneCfg,
+				); applyErr != nil {
+					s.Stop()
+					color.Yellow("  apply-config retry: %v\n", applyErr)
+					s.Start()
+				} else {
+					s.Stop()
+					color.Green("  ✓ apply-config retry succeeded — waiting for reboot\n")
+					s.Start()
+				}
+				// Reset the maintenance-mode timer so we don't re-retry immediately.
+				port50kUpSince = time.Time{}
+			}
+		} else {
+			// Port is DOWN — machine is rebooting; reset the maintenance-mode timer.
+			port50kUpSince = time.Time{}
 		}
 
 		// After 3 minutes, check if SSH (Ubuntu) is responding.
 		// If it is, the machine booted back into Ubuntu — fail immediately
-		// rather than burning 20 minutes of CI time.
+		// rather than burning 35 minutes of CI time.
 		if time.Since(start) > 3*time.Minute {
 			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
 				conn.Close()
@@ -294,7 +356,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host 
 	}
 
 	s.Stop()
-	return fmt.Errorf("Talos gRPC API at %s did not become ready within 20 minutes", host)
+	return fmt.Errorf("Talos gRPC API at %s did not become ready within 35 minutes", host)
 }
 
 // waitForKubernetesAPI polls kubectl until the API server responds.
