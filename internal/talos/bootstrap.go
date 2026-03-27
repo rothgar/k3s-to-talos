@@ -173,7 +173,7 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 	deadline := time.Now().Add(20 * time.Minute)
 	wait := 5 * time.Second
 	start := time.Now()
-	sshChecked := false
+	var lastSSHCheck time.Time // zero = never checked
 
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -185,14 +185,19 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 			return nil
 		}
 
-		if !sshChecked && time.Since(start) > 3*time.Minute {
-			sshChecked = true
-			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
-				conn.Close()
+		// Periodically check if Ubuntu SSH is up — that means Talos failed to boot.
+		// Check every 30 s after the first 3 minutes (allow for initial reboot time).
+		if time.Since(start) > 3*time.Minute && time.Since(lastSSHCheck) > 30*time.Second {
+			lastSSHCheck = time.Now()
+			elapsed := time.Since(start).Round(time.Second)
+			if tcpProbe(host+":22", 3*time.Second) {
 				s.Stop()
-				color.Yellow("\n  ⚠  Port 22 (SSH) is responding on %s\n", host)
-				color.Yellow("  ⚠  Machine rebooted back into Ubuntu instead of Talos!\n\n")
-				s.Start()
+				return fmt.Errorf(
+					"machine at %s rebooted back into Ubuntu (port 22 is UP after %s, "+
+						"port 50000 is DOWN) — Talos did not boot.\n"+
+						"Check the agent log in the backup artifact for kexec/EFI boot errors.",
+					host, elapsed,
+				)
 			}
 		}
 

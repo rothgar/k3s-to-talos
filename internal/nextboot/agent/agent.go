@@ -727,6 +727,27 @@ func compressZstd(data []byte) ([]byte, error) {
 }
 
 func prepareKexec(imageURL string, configData []byte) error {
+	// On AWS EC2 Nitro instances, kexec is unreliable because the ENA
+	// (Elastic Network Adapter) driver does not cleanly reinitialize after a
+	// kexec jump: the new Talos kernel may not be able to bring up eth0,
+	// making port 50000 unreachable from the outside even though Talos is
+	// running.  A normal hardware reboot lets the EC2 firmware reinitialize
+	// all PCI devices before handing off to UEFI → GRUB → Talos, which
+	// reliably initializes ENA.  Prefer hardware reboot on EC2.
+	for _, dmiPath := range []string{
+		"/sys/class/dmi/id/sys_vendor",
+		"/sys/class/dmi/id/board_vendor",
+		"/sys/class/dmi/id/bios_vendor",
+	} {
+		if data, err := os.ReadFile(dmiPath); err == nil {
+			v := strings.TrimSpace(string(data))
+			if strings.Contains(v, "Amazon") {
+				log("EC2 detected via %s (%q) — skipping kexec; hardware reboot will be used instead.", dmiPath, v)
+				return fmt.Errorf("EC2 Nitro detected: kexec skipped to ensure reliable ENA NIC initialization via firmware boot")
+			}
+		}
+	}
+
 	// Check for kernel lockdown — kexec_load is blocked when lockdown is
 	// active (e.g. with Secure Boot on Ubuntu).  Skip early to avoid
 	// downloading several hundred MB only to fail.
