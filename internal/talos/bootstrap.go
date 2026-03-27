@@ -245,9 +245,10 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host 
 	deadline := time.Now().Add(20 * time.Minute)
 	wait := 5 * time.Second
 	start := time.Now()
-	sshChecked := false
+	attempt := 0
 
 	for time.Now().Before(deadline) {
+		attempt++
 		// --timeout 15s prevents the check from hanging indefinitely when
 		// machined accepts the TCP connection but hasn't loaded its certs yet.
 		err := b.runTalosctl(talosctlPath, talosConfigFile,
@@ -262,14 +263,27 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host 
 			return nil
 		}
 
-		// After 3 minutes warn if SSH (Ubuntu) is responding instead of Talos.
-		if !sshChecked && time.Since(start) > 3*time.Minute {
-			sshChecked = true
+		// Log the actual error every few attempts so CI logs are informative.
+		if attempt == 1 || attempt%5 == 0 {
+			s.Stop()
+			color.Yellow("  [attempt %d] talosctl version: %v\n", attempt, err)
+			s.Start()
+		}
+
+		// After 3 minutes, check if SSH (Ubuntu) is responding.
+		// If it is, the machine booted back into Ubuntu — fail immediately
+		// rather than burning 20 minutes of CI time.
+		if time.Since(start) > 3*time.Minute {
 			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
 				conn.Close()
 				s.Stop()
-				color.Yellow("\n  ⚠  Port 22 (SSH) is responding — machine may have rebooted back into Ubuntu!\n")
-				s.Start()
+				color.Yellow("\n  ⚠  Port 22 (SSH) is responding — machine has rebooted back into Ubuntu!\n")
+				color.Yellow("  ⚠  Talos did not boot after the EFI reboot. Failing early.\n")
+				return fmt.Errorf(
+					"machine at %s booted back into Ubuntu instead of Talos "+
+						"(port 22 is responding, port 50000 is not ready after %s)",
+					host, time.Since(start).Round(time.Second),
+				)
 			}
 		}
 

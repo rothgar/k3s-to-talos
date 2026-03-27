@@ -57,7 +57,28 @@ func Run(opts Options) error {
 	log("Image URL  : %s", opts.ImageURL)
 	log("═══════════════════════════════════════════════════════════")
 
-	// ── 2. Ensure required decompressor is present ───────────────────────────
+	// ── 2. Attempt to pre-load Talos kernel via kexec ────────────────────────
+	//
+	// kexec -l loads the Talos kernel + initramfs into RAM now, while Ubuntu
+	// is still running and the system is fully intact.  Later, after the disk
+	// has been written and the machine config written to STATE, we call
+	// "kexec -e" to jump directly into the Talos kernel — bypassing UEFI,
+	// GRUB, and all the NVRAM/Secure-Boot complexity that plagues hardware
+	// reboots on cloud VMs.
+	//
+	// If kexec is unavailable or blocked (kernel lockdown / Secure Boot),
+	// prepareKexec returns an error and we fall back to a hardware reboot
+	// using the EFI file patch + BootNext mechanism below.
+	kexecLoaded := false
+	if kexecErr := prepareKexec(opts.ImageURL); kexecErr != nil {
+		log("kexec pre-load skipped: %v", kexecErr)
+		log("Will use hardware reboot (EFI file patch + BootNext) instead.")
+	} else {
+		kexecLoaded = true
+		log("kexec kernel loaded into RAM — will use kexec -e for the final boot.")
+	}
+
+	// ── 3. Ensure required decompressor is present ───────────────────────────
 	if strings.HasSuffix(opts.ImageURL, ".zst") {
 		if err := ensureTool("zstd"); err != nil {
 			return err
@@ -68,7 +89,7 @@ func Run(opts Options) error {
 		}
 	}
 
-	// ── 3. Download, decompress, write to disk in one streaming pipeline ─────
+	// ── 4. Download, decompress, write to disk in one streaming pipeline ─────
 	log("Starting download → decompress → disk pipeline...")
 	log("  !! This will ERASE all data on %s. Starting in 5 seconds !!", disk)
 	for i := 5; i > 0; i-- {
@@ -164,8 +185,22 @@ func Run(opts Options) error {
 	log("═══════════════════════════════════════════════════════════")
 	log("Talos installation complete.")
 
-	// ── 8. Reboot into Talos ─────────────────────────────────────────────────
+	// ── 8. Boot into Talos ───────────────────────────────────────────────────
 	if opts.Reboot {
+		if kexecLoaded {
+			// Preferred: jump directly into the Talos kernel via kexec.
+			// This bypasses UEFI, GRUB, and NVRAM entirely — the most
+			// reliable boot path on cloud VMs where EFI variable stores
+			// may be read-only or get reset between reboots.
+			log("Jumping into Talos Linux via kexec -e ...")
+			time.Sleep(1 * time.Second)
+			if out, err := exec.Command("kexec", "-e").CombinedOutput(); err != nil {
+				// kexec -e should not return on success; if it does, fall through.
+				log("kexec -e failed (%v: %s) — falling back to hardware reboot.", err, strings.TrimSpace(string(out)))
+			}
+		}
+		// Fallback (or kexec not loaded): trigger a hardware reboot.
+		// The EFI file patch + BootNext set above ensure the machine boots Talos.
 		log("Rebooting into Talos Linux via hardware reboot...")
 		time.Sleep(2 * time.Second)
 		return reboot()
@@ -849,15 +884,50 @@ func updateUEFIBoot(disk string) error {
 	bootNum := string(match[1])
 	log("Created UEFI boot entry Boot%s for Talos.", bootNum)
 
-	// Set BootNext so this entry is used on the next boot (one-shot override).
+	// Set BootNext so this entry is used on the very next boot (one-shot).
 	if out2, err := exec.Command("efibootmgr", "--bootnext", bootNum).CombinedOutput(); err != nil {
 		return fmt.Errorf("efibootmgr --bootnext %s: %w\n%s", bootNum, err, string(out2))
 	}
-	log("UEFI BootNext → Boot%s (Talos will boot immediately on next restart).", bootNum)
+	log("UEFI BootNext → Boot%s (Talos will boot on the next restart).", bootNum)
+
+	// Also prepend Talos to BootOrder so that after BootNext is consumed
+	// (it's a one-shot flag), subsequent hardware reboots also boot Talos
+	// rather than falling back to the Ubuntu entry.
+	//
+	// Parse the current BootOrder from efibootmgr output, prepend our entry,
+	// and write it back.  Failures here are non-fatal — BootNext alone plus
+	// the EFI file patch is still a viable fallback.
+	if boOut, err := exec.Command("efibootmgr").CombinedOutput(); err == nil {
+		boLine := ""
+		for _, line := range strings.Split(string(boOut), "\n") {
+			if strings.HasPrefix(line, "BootOrder:") {
+				boLine = strings.TrimPrefix(line, "BootOrder:")
+				boLine = strings.TrimSpace(boLine)
+				break
+			}
+		}
+		newOrder := bootNum
+		if boLine != "" {
+			// Remove any existing Talos entries to avoid duplicates.
+			var parts []string
+			for _, part := range strings.Split(boLine, ",") {
+				part = strings.TrimSpace(part)
+				if !strings.EqualFold(part, bootNum) {
+					parts = append(parts, part)
+				}
+			}
+			newOrder = bootNum + "," + strings.Join(parts, ",")
+		}
+		if out3, err := exec.Command("efibootmgr", "--bootorder", newOrder).CombinedOutput(); err != nil {
+			log("Warning: could not update BootOrder: %v (%s)", err, strings.TrimSpace(string(out3)))
+		} else {
+			log("UEFI BootOrder updated — Talos (Boot%s) is now first.", bootNum)
+		}
+	}
 
 	// Log NVRAM state after changes for diagnostics.
-	if out3, err := exec.Command("efibootmgr", "-v").CombinedOutput(); err == nil {
-		log("NVRAM after efibootmgr changes:\n%s", strings.TrimSpace(string(out3)))
+	if out4, err := exec.Command("efibootmgr", "-v").CombinedOutput(); err == nil {
+		log("NVRAM after efibootmgr changes:\n%s", strings.TrimSpace(string(out4)))
 	}
 
 	return nil
