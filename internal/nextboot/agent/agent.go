@@ -76,13 +76,19 @@ func Run(opts Options) error {
 	// directly in the kexec cmdline via talos.config.inline.  This makes
 	// the kexec-booted Talos start in configured mode rather than maintenance
 	// mode, avoiding the apply-config → hardware-reboot cycle entirely.
+	// Read the machine config now, while Ubuntu is still intact.
+	// This data is used in two ways:
+	//   1. Embedded in the kexec cmdline (if kexec is used).
+	//   2. Written to the Talos STATE partition after disk write (hardware
+	//      reboot path).  We MUST read it here because after the disk write
+	//      the Ubuntu filesystem is gone and the file is unreadable.
 	var kexecConfigData []byte
 	if opts.Config != "" {
 		if data, err := os.ReadFile(opts.Config); err == nil {
 			kexecConfigData = data
-			log("Machine config read (%d bytes) — will embed in kexec cmdline.", len(data))
+			log("Machine config read (%d bytes).", len(data))
 		} else {
-			log("Warning: could not read config for kexec inline: %v", err)
+			log("Warning: could not read config %s: %v", opts.Config, err)
 		}
 	}
 	kexecLoaded := false
@@ -94,7 +100,18 @@ func Run(opts Options) error {
 		log("kexec kernel loaded into RAM — will use kexec -e for the final boot.")
 	}
 
-	// ── 3. Ensure required decompressor is present ───────────────────────────
+	// ── 3. Pre-install all tools needed before AND after the disk write ─────────
+	//
+	// CRITICAL: After writing the Talos image to disk we drop the block device
+	// buffer caches (sync + BLKFLSBUF).  On EC2, /tmp and the root filesystem
+	// are both on the same NVMe volume that we are about to overwrite.  Any
+	// exec() call after the disk write would try to load the binary from a disk
+	// that no longer contains Ubuntu data, returning EBADMSG ("bad message").
+	//
+	// Installing all tools NOW — while Ubuntu is still intact — ensures their
+	// binary pages are resident in the kernel page cache.  As long as the system
+	// isn't under severe memory pressure the pages will survive until we need
+	// them.  (On a typical CI t3.medium with ~4 GiB RAM this is always true.)
 	if strings.HasSuffix(opts.ImageURL, ".zst") {
 		if err := ensureTool("zstd"); err != nil {
 			return err
@@ -103,6 +120,14 @@ func Run(opts Options) error {
 		if err := ensureTool("xz"); err != nil {
 			return err
 		}
+	}
+	// sgdisk (gdisk package) — GPT relocation after disk write.
+	if err := ensureTool("sgdisk"); err != nil {
+		log("Warning: could not pre-install sgdisk: %v — GPT relocation will be skipped", err)
+	}
+	// efibootmgr — UEFI NVRAM update after disk write.
+	if err := ensureTool("efibootmgr"); err != nil {
+		log("Warning: could not pre-install efibootmgr: %v — UEFI boot entry update will be skipped", err)
 	}
 
 	// ── 4. Download, decompress, write to disk in one streaming pipeline ─────
@@ -123,20 +148,23 @@ func Run(opts Options) error {
 	}
 	log("Disk write complete.")
 
-	// Flush all dirty pages to disk and drop the page cache so that
-	// subsequent partition mounts see the Talos data we just wrote rather
-	// than stale Ubuntu content.  This is especially important for the EFI
-	// partition (/dev/xvda1) which Ubuntu has mounted at /boot/efi — after
-	// dd the kernel's page cache for that device still contains Ubuntu EFI
-	// files until explicitly dropped.
+	// Flush all dirty pages to disk.
+	//
+	// We deliberately do NOT drop the global page cache here.  On EC2 the
+	// root filesystem and /tmp both live on the same NVMe device we just
+	// overwrote.  Dropping all page caches evicts the Ubuntu binary pages
+	// (/usr/sbin/sgdisk, /usr/sbin/efibootmgr, etc.) from memory; any
+	// subsequent exec() returns EBADMSG because the kernel tries to reload
+	// those pages from a disk that no longer contains Ubuntu data.
+	//
+	// Correctness of later reads:
+	//   The loop device we create for the Talos EFI partition is backed by
+	//   /dev/nvme0n1 (the raw disk), not by the partition device.  The page
+	//   cache for /dev/nvme0n1 was populated with Talos data by the disk
+	//   write above, so subsequent reads through the loop device see Talos
+	//   data without any cache drop.
 	exec.Command("sync").Run() //nolint:errcheck
-	if f, err := os.OpenFile("/proc/sys/vm/drop_caches", os.O_WRONLY, 0); err == nil {
-		_, _ = f.WriteString("3\n")
-		f.Close()
-		log("Global sync + page cache dropped — subsequent reads will see new disk content.")
-	} else {
-		log("Warning: could not drop page cache (%v); stale reads possible.", err)
-	}
+	log("Disk sync complete.")
 
 	// Relocate the backup GPT header to the end of the disk.  The Talos
 	// metal raw image was designed for a ~200 MB disk; when written to a
@@ -211,16 +239,20 @@ func Run(opts Options) error {
 	}
 
 	// ── 5. Write machine config to STATE partition ───────────────────────────
-	if opts.Config != "" {
-		configData, err := os.ReadFile(opts.Config)
-		if err != nil {
-			log("Warning: could not read config %s: %v", opts.Config, err)
-			log("Talos will boot in maintenance mode.")
-		} else if err := writeConfig(disk, configData); err != nil {
+	//
+	// Use kexecConfigData (read before the disk write while Ubuntu was still
+	// intact) rather than re-reading from disk.  After the disk write the
+	// Ubuntu filesystem no longer exists on disk, and a fresh read of
+	// opts.Config would fail with EBADMSG.
+	if len(kexecConfigData) > 0 {
+		if err := writeConfig(disk, kexecConfigData); err != nil {
 			log("Warning: %v", err)
 			log("Talos will boot in maintenance mode.")
 			log("  talosctl apply-config --insecure --nodes <ip> --file controlplane.yaml")
 		}
+	} else if opts.Config != "" {
+		log("Warning: machine config was not pre-read; Talos will boot in maintenance mode.")
+		log("  talosctl apply-config --insecure --nodes <ip> --file controlplane.yaml")
 	}
 
 	log("═══════════════════════════════════════════════════════════")
