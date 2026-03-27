@@ -414,17 +414,20 @@ func writeConfig(disk string, config []byte) error {
 	blkidOut, _ := exec.Command("blkid", "-o", "value", "-s", "TYPE", loopDev).Output()
 	fsType := strings.TrimSpace(string(blkidOut))
 	if fsType == "" {
-		log("STATE partition is unformatted — creating XFS filesystem (label STATEPART)...")
+		log("STATE partition is unformatted — creating XFS filesystem (label STATE)...")
 		// Ensure mkfs.xfs is available.
 		if _, lookErr := exec.LookPath("mkfs.xfs"); lookErr != nil {
 			if out2, aptErr := exec.Command("apt-get", "install", "-y", "-q", "xfsprogs").CombinedOutput(); aptErr != nil {
 				return fmt.Errorf("installing xfsprogs for mkfs.xfs: %w\n%s", aptErr, string(out2))
 			}
 		}
-		if out2, fmtErr := exec.Command("mkfs.xfs", "-L", "STATEPART", "-f", loopDev).CombinedOutput(); fmtErr != nil {
+		// Use label "STATE" — Talos identifies the STATE partition by this XFS
+		// filesystem label.  A different label causes machined to re-format the
+		// partition on first boot, wiping any config.yaml we wrote.
+		if out2, fmtErr := exec.Command("mkfs.xfs", "-L", "STATE", "-f", loopDev).CombinedOutput(); fmtErr != nil {
 			return fmt.Errorf("mkfs.xfs for STATE partition: %w\n%s", fmtErr, string(out2))
 		}
-		log("STATE partition formatted as XFS (label=STATEPART).")
+		log("STATE partition formatted as XFS (label=STATE).")
 	} else {
 		log("STATE partition filesystem type: %s", fsType)
 	}
@@ -655,24 +658,39 @@ func prepareKexec(imageURL string, configData []byte) error {
 		"net.ifnames=0 init_on_alloc=1 slab_nomerge pti=on " +
 		"consoleblank=0 random.trust_cpu=on printk.devkmsg=on"
 
-	// Embed the machine config inline in the kexec cmdline when available.
+	// Embed the machine config inline in the kexec cmdline when it fits.
 	// talos.config.inline accepts a zstd-compressed, base64-encoded machine
 	// config.  This causes Talos to start in configured mode rather than
 	// maintenance mode, completely bypassing the apply-config → hardware-
 	// reboot cycle that causes the CI timeout.
+	//
+	// Linux kernel cmdline limit is 4096 bytes.  A typical Talos config with
+	// PEM certificates compresses to ~1-2 KiB with zstd, which base64-encodes
+	// to ~1.3-2.7 KiB.  Combined with the ~170-char prefix that usually fits,
+	// but larger configs (>3 KiB compressed) would exceed the limit and silently
+	// truncate the cmdline, corrupting the base64.  We check the total length
+	// before adding the inline param; if it's too large, Talos falls back to
+	// the STATE partition (which we also write in writeConfig below).
+	const cmdlineMax = 4096
 	if len(configData) > 0 {
 		compressed, err := compressZstd(configData)
 		if err != nil {
-			log("Warning: could not compress config for inline embed: %v — Talos will use STATE partition or maintenance mode", err)
+			log("Warning: could not compress config for inline embed: %v — relying on STATE partition", err)
 		} else {
 			encoded := base64.StdEncoding.EncodeToString(compressed)
-			cmdLine += " talos.config.inline=" + encoded
-			log("Machine config embedded in kexec cmdline via talos.config.inline (%d bytes → %d bytes compressed → %d chars base64)",
-				len(configData), len(compressed), len(encoded))
+			candidate := cmdLine + " talos.config.inline=" + encoded
+			if len(candidate) <= cmdlineMax {
+				cmdLine = candidate
+				log("Machine config embedded in kexec cmdline via talos.config.inline (%d bytes → %d bytes compressed → %d chars base64, total cmdline %d chars)",
+					len(configData), len(compressed), len(encoded), len(cmdLine))
+			} else {
+				log("Config too large for inline embed (%d chars would exceed %d-char limit) — relying on STATE partition",
+					len(candidate), cmdlineMax)
+			}
 		}
 	}
 
-	log("kexec cmdline (first 200 chars): %.200s", cmdLine)
+	log("kexec cmdline (%d chars, first 200 shown): %.200s", len(cmdLine), cmdLine)
 
 	log("Loading Talos kernel into RAM via kexec -l ...")
 	if out, err := exec.Command("kexec",
