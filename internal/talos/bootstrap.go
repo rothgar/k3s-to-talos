@@ -40,34 +40,42 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		return fmt.Errorf("talosctl not found in PATH")
 	}
 
-	// Step 1: Wait for Talos API to come up
+	// Step 1: Wait for Talos to respond on port 50000 (TCP).
+	// This is an early-presence check only — the port may be open before the
+	// gRPC+TLS stack is fully initialised.
 	if err := b.waitForTalosAPI(opts.Host); err != nil {
 		return err
 	}
 
 	// Step 2: Apply control plane config (--insecure targets maintenance mode).
-	// If Talos booted with the config already written to the STATE partition,
-	// this step is effectively a no-op or may return an error — both are OK.
+	// If Talos booted with the config already written to the STATE partition by
+	// the nextboot agent, this call will fail (the insecure endpoint is gone).
+	// Both outcomes are fine; we continue either way.
 	fmt.Println("  Applying control plane configuration...")
 	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
 		"apply-config", "--insecure",
 		"--nodes", opts.Host,
 		"--file", opts.ControlPlaneCfg,
 	); err != nil {
-		// If the node already has a config (booted from STATE partition),
-		// apply-config --insecure will fail — treat that as non-fatal.
 		color.Yellow("  Warning: apply-config returned an error (node may already be configured): %v\n", err)
 		color.Yellow("  Continuing — assuming config was pre-applied by nextboot-talos script.\n")
 	} else {
 		color.Green("  ✓ Control plane config applied\n")
 	}
 
-	// Step 2b: Wait for Talos to reboot after apply-config.
-	// apply-config causes an immediate reboot in maintenance mode; the API
-	// drops briefly then returns when the node is in configured mode.
-	fmt.Println("  Waiting for Talos to reboot after config apply (up to 10 minutes)...")
-	time.Sleep(15 * time.Second) // give the reboot time to start
-	if err := b.waitForTalosAPI(opts.Host); err != nil {
+	// Step 2b: Wait for Talos gRPC API to be ready.
+	//
+	// The TCP dial above only proves that something is listening on port 50000.
+	// machined may not yet have loaded the node's CA cert, so talosctl calls
+	// that use CA-verified TLS (e.g. bootstrap) will fail with TLS errors.
+	//
+	// We poll "talosctl version" until it succeeds: that confirms the gRPC
+	// server is up, the cert was generated from the config CA, and talosctl
+	// can authenticate.  A short sleep first gives apply-config time to
+	// trigger a reboot if the node was in maintenance mode.
+	fmt.Println("  Waiting for Talos gRPC API to be ready (up to 20 minutes)...")
+	time.Sleep(5 * time.Second)
+	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host); err != nil {
 		return fmt.Errorf("waiting for Talos after config apply: %w", err)
 	}
 
@@ -220,6 +228,59 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 		addr, b.backupDir+"/talos-config/talosconfig", host,
 		b.backupDir+"/talos-config/talosconfig", host,
 	)
+}
+
+// waitForTalosctlReady polls "talosctl version" until it succeeds.
+// Unlike the TCP dial in waitForTalosAPI, this verifies that the gRPC server is
+// up AND that the node's CA cert matches the talosconfig — i.e. the node has
+// applied the machine config and is ready for authenticated API calls like
+// "bootstrap".  This prevents a race condition where the TCP port opens before
+// machined has loaded its TLS identity from the config.
+func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host string) error {
+	s := spinner.New(spinner.CharSets[14], 200*time.Millisecond)
+	s.Suffix = " Waiting for Talos gRPC API (CA-verified)..."
+	s.Start()
+	defer s.Stop()
+
+	deadline := time.Now().Add(20 * time.Minute)
+	wait := 5 * time.Second
+	start := time.Now()
+	sshChecked := false
+
+	for time.Now().Before(deadline) {
+		// --timeout 15s prevents the check from hanging indefinitely when
+		// machined accepts the TCP connection but hasn't loaded its certs yet.
+		err := b.runTalosctl(talosctlPath, talosConfigFile,
+			"version",
+			"--nodes", host,
+			"--endpoints", host,
+			"--timeout", "15s",
+		)
+		if err == nil {
+			s.Stop()
+			color.Green("  ✓ Talos gRPC API is ready\n")
+			return nil
+		}
+
+		// After 3 minutes warn if SSH (Ubuntu) is responding instead of Talos.
+		if !sshChecked && time.Since(start) > 3*time.Minute {
+			sshChecked = true
+			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
+				conn.Close()
+				s.Stop()
+				color.Yellow("\n  ⚠  Port 22 (SSH) is responding — machine may have rebooted back into Ubuntu!\n")
+				s.Start()
+			}
+		}
+
+		time.Sleep(wait)
+		if wait < 30*time.Second {
+			wait *= 2
+		}
+	}
+
+	s.Stop()
+	return fmt.Errorf("Talos gRPC API at %s did not become ready within 20 minutes", host)
 }
 
 // waitForKubernetesAPI polls kubectl until the API server responds.
