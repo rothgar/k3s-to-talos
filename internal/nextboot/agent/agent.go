@@ -476,10 +476,20 @@ func writeConfig(disk string, config []byte) error {
 	return nil
 }
 
-// losetupStatePartition finds the STATE partition (4th in Talos GPT) using
-// sfdisk, then creates a losetup loop device over the exact byte range.
-// This bypasses the kernel's potentially stale per-partition VFS state
-// after the disk was overwritten with a new GPT layout.
+// losetupStatePartition finds the Talos STATE partition using sfdisk, then
+// creates a losetup loop device over the exact byte range.
+//
+// Partition identification strategy (in order of preference):
+//  1. GPT partition label == "STATE"  (reliable across all Talos layouts)
+//  2. Node suffix "4" or "p4"         (old 5-partition layout: EFI/BIOS/META/STATE/EPHEMERAL)
+//  3. Index 3 (4th) only when ≥5 partitions exist (same old layout)
+//
+// In Talos v1.12+ with VolumeManagerController, the factory metal raw image
+// ships with only 4 partitions (EFI, BIOS, BOOT/META variants) and STATE is
+// created dynamically on first boot.  If STATE is not present in the GPT,
+// this function returns an error and writeConfig gracefully skips the STATE
+// write — Talos will use the talos.config.inline kexec cmdline parameter
+// (embedded by prepareKexec) to deliver the machine config on first boot.
 func losetupStatePartition(disk string) (loopDev string, cleanup func(), err error) {
 	cleanup = func() {}
 
@@ -496,6 +506,7 @@ func losetupStatePartition(disk string) (loopDev string, cleanup func(), err err
 				Start int64  `json:"start"`
 				Size  int64  `json:"size"`
 				Type  string `json:"type"`
+				Name  string `json:"name"` // GPT partition label (e.g. "STATE", "META")
 			} `json:"partitions"`
 		} `json:"partitiontable"`
 	}
@@ -503,36 +514,70 @@ func losetupStatePartition(disk string) (loopDev string, cleanup func(), err err
 		return "", cleanup, fmt.Errorf("parsing sfdisk output: %w", err)
 	}
 
+	// Log all partitions for diagnostics.
+	log("Partition table (%d partitions):", len(pt.PartitionTable.Partitions))
+	for i, p := range pt.PartitionTable.Partitions {
+		log("  [%d] node=%-12s start=%-8d size=%-8d type=%s name=%q",
+			i+1, p.Node, p.Start, p.Size, p.Type, p.Name)
+	}
+
 	sectorSize := pt.PartitionTable.SectorSize
 	if sectorSize == 0 {
 		sectorSize = 512
 	}
 
-	// STATE is the 4th partition in Talos GPT.  Match by node suffix "4"
-	// (xvda4, sda4) or "p4" (nvme0n1p4, mmcblk0p4).
 	var stateStart, stateSize int64
 	var stateNode string
+
+	// 1. Primary: find by GPT partition label "STATE".
 	for _, p := range pt.PartitionTable.Partitions {
-		if strings.HasSuffix(p.Node, "p4") || strings.HasSuffix(p.Node, "4") {
+		if strings.EqualFold(p.Name, "STATE") {
 			stateStart = p.Start
 			stateSize = p.Size
 			stateNode = p.Node
+			log("STATE partition found by GPT label: %s start=%d size=%d sectors (%d MiB)",
+				stateNode, stateStart, stateSize, stateSize*sectorSize>>20)
 			break
 		}
 	}
-	// Fallback: 4th partition by array index.
-	if stateStart == 0 && len(pt.PartitionTable.Partitions) >= 4 {
-		p := pt.PartitionTable.Partitions[3]
-		stateStart = p.Start
-		stateSize = p.Size
-		stateNode = p.Node
-		log("STATE partition (fallback index 4): %s start=%d size=%d sectors", stateNode, stateStart, stateSize)
-	}
+
+	// 2. Fallback: node suffix "4"/"p4" (old 5-partition layout) —
+	//    only when the partition is not labeled META (avoid overwriting META).
 	if stateStart == 0 {
-		return "", cleanup, fmt.Errorf("could not find STATE partition (partition 4) in %s", disk)
+		for _, p := range pt.PartitionTable.Partitions {
+			if strings.HasSuffix(p.Node, "p4") || strings.HasSuffix(p.Node, "4") {
+				if strings.EqualFold(p.Name, "META") {
+					log("Partition %s is labeled META — skipping (not STATE)", p.Node)
+					break
+				}
+				stateStart = p.Start
+				stateSize = p.Size
+				stateNode = p.Node
+				log("STATE partition found by node suffix (4): %s start=%d size=%d sectors",
+					stateNode, stateStart, stateSize)
+				break
+			}
+		}
 	}
-	log("STATE partition: %s start=%d size=%d sectors (%d MiB)",
-		stateNode, stateStart, stateSize, stateSize*sectorSize>>20)
+
+	// 3. Fallback: 4th partition by index, only when ≥5 partitions exist.
+	if stateStart == 0 && len(pt.PartitionTable.Partitions) >= 5 {
+		p := pt.PartitionTable.Partitions[3]
+		if !strings.EqualFold(p.Name, "META") {
+			stateStart = p.Start
+			stateSize = p.Size
+			stateNode = p.Node
+			log("STATE partition (fallback index 4 of %d): %s start=%d size=%d sectors",
+				len(pt.PartitionTable.Partitions), stateNode, stateStart, stateSize)
+		}
+	}
+
+	if stateStart == 0 {
+		return "", cleanup, fmt.Errorf(
+			"STATE partition not found in %s GPT (%d partitions) — "+
+				"Talos will create it on first boot; talos.config.inline kexec cmdline will deliver config",
+			disk, len(pt.PartitionTable.Partitions))
+	}
 
 	out, err := exec.Command("losetup", "-f", "--show",
 		fmt.Sprintf("--offset=%d", stateStart*sectorSize),

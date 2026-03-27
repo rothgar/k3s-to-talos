@@ -76,13 +76,8 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
 				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
 			} else {
-				color.Green("  ✓ Control plane config applied (Talos will reboot)\n")
+				color.Green("  ✓ Control plane config applied — Talos will transition to configured mode\n")
 			}
-			// Wait for the reboot to begin before entering the poll loop.
-			// This prevents waitForTalosctlReady from immediately re-firing
-			// apply-config before the machine even starts rebooting.
-			fmt.Println("  Waiting for reboot to start (up to 60 s)...")
-			b.waitForPortDown(opts.Host, 50000, 60*time.Second)
 		} else {
 			fmt.Println("  Maintenance-mode endpoint not responding — proceeding to gRPC readiness check.")
 		}
@@ -252,27 +247,6 @@ func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host 
 		}
 	}
 	return false
-}
-
-// waitForPortDown polls until the given port is no longer accepting connections.
-// Returns when the port goes down, or when the timeout is reached.
-func (b *Bootstrapper) waitForPortDown(host string, port int, timeout time.Duration) {
-	addr := fmt.Sprintf("%s:%d", host, port)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if conn, err := net.DialTimeout("tcp", addr, 2*time.Second); err != nil {
-			conn.Close()
-		} else {
-			// port is still up
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		// port is down
-		color.Green("  ✓ Port %d went DOWN — reboot in progress\n", port)
-		return
-	}
-	color.Yellow("  Port %d still UP after %s — reboot may have been fast or not triggered\n",
-		port, timeout)
 }
 
 // waitForTalosctlReady polls "talosctl version" (CA-verified) until it
