@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,35 +47,46 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		return err
 	}
 
-	// Step 2: Apply control plane config (--insecure targets maintenance mode).
-	// If Talos booted with the config already written to the STATE partition by
-	// the nextboot agent, this call will fail (the insecure endpoint is gone).
-	// Both outcomes are fine; we continue either way.
-	fmt.Println("  Applying control plane configuration...")
-	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
-		"apply-config", "--insecure",
-		"--nodes", opts.Host,
-		"--file", opts.ControlPlaneCfg,
-	); err != nil {
-		color.Yellow("  Warning: apply-config returned an error (node may already be configured): %v\n", err)
-		color.Yellow("  Continuing — assuming config was pre-applied by nextboot-talos script.\n")
+	// Step 2: Apply control plane config if Talos is in maintenance mode.
+	//
+	// First we check whether the insecure (maintenance) endpoint is active.
+	// The TCP port may open before machined is fully initialised, so we poll
+	// the insecure gRPC endpoint for up to 90 seconds before deciding.
+	//
+	//   - Insecure endpoint responds → Talos is in maintenance mode.
+	//     Send apply-config so Talos writes the config to STATE and reboots.
+	//   - Insecure endpoint does not respond → Talos is already in configured
+	//     mode (the config was pre-applied by the nextboot agent).
+	//     Skip apply-config; proceed directly to waitForTalosctlReady.
+	inMaintenanceMode := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
+	if inMaintenanceMode {
+		fmt.Println("  Talos is in maintenance mode — applying control plane configuration...")
+		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+			"apply-config", "--insecure",
+			"--nodes", opts.Host,
+			"--file", opts.ControlPlaneCfg,
+		); err != nil {
+			color.Yellow("  Warning: apply-config returned an error: %v\n", err)
+			color.Yellow("  Will retry inside waitForTalosctlReady.\n")
+		} else {
+			color.Green("  ✓ Control plane config applied (Talos will reboot)\n")
+		}
+		// Give Talos time to begin its reboot before we start polling.
+		fmt.Println("  Waiting 45 s for Talos to process the config and begin reboot...")
+		time.Sleep(45 * time.Second)
 	} else {
-		color.Green("  ✓ Control plane config applied\n")
+		fmt.Println("  Talos maintenance-mode endpoint not responding — node may already be configured.")
+		fmt.Println("  Proceeding directly to gRPC API readiness check.")
 	}
 
 	// Step 2b: Wait for Talos gRPC API to be ready.
 	//
-	// The TCP dial above only proves that something is listening on port 50000.
-	// machined may not yet have loaded the node's CA cert, so talosctl calls
-	// that use CA-verified TLS (e.g. bootstrap) will fail with TLS errors.
-	//
 	// We poll "talosctl version" until it succeeds: that confirms the gRPC
 	// server is up, the cert was generated from the config CA, and talosctl
-	// can authenticate.  A short sleep first gives apply-config time to
-	// trigger a reboot if the node was in maintenance mode.
+	// can authenticate.  The loop also detects (and retries) the case where
+	// apply-config triggers a hardware reboot back into maintenance mode.
 	fmt.Println("  Waiting for Talos gRPC API to be ready (up to 35 minutes)...")
-	time.Sleep(5 * time.Second)
-	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host); err != nil {
+	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host, opts.ControlPlaneCfg); err != nil {
 		return fmt.Errorf("waiting for Talos after config apply: %w", err)
 	}
 
@@ -231,6 +241,31 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 	)
 }
 
+// probeMaintenanceMode checks whether Talos is in maintenance mode by polling
+// the insecure (unauthenticated) gRPC endpoint.  It returns true if the
+// insecure endpoint responds within the given timeout.
+func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	wait := 3 * time.Second
+	for time.Now().Before(deadline) {
+		err := b.runTalosctl(talosctlPath, talosConfigFile,
+			"version", "--insecure",
+			"--nodes", host,
+			"--endpoints", host,
+			"--timeout", "10s",
+		)
+		if err == nil {
+			color.Green("  ✓ Maintenance mode endpoint responded (insecure)\n")
+			return true
+		}
+		time.Sleep(wait)
+		if wait < 15*time.Second {
+			wait += 3 * time.Second
+		}
+	}
+	return false
+}
+
 // waitForTalosctlReady polls "talosctl version" until it succeeds.
 // Unlike the TCP dial in waitForTalosAPI, this verifies that the gRPC server is
 // up AND that the node's CA cert matches the talosconfig — i.e. the node has
@@ -242,22 +277,27 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 //   - Port UP + cert error  → Talos is in maintenance mode (self-signed cert)
 //   - Port DOWN             → machine is rebooting (expected after apply-config)
 //
-// If port 50000 has been continuously reachable for >5 minutes with persistent
-// cert failures, apply-config is retried in case the first attempt was dropped.
-func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host string) error {
+// When maintenance mode is detected for >3 minutes, apply-config is retried.
+// Up to maxApplyRetries retries are allowed (once per maintenance-mode window).
+func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host, controlPlaneCfg string) error {
 	s := spinner.New(spinner.CharSets[14], 200*time.Millisecond)
 	s.Suffix = " Waiting for Talos gRPC API (CA-verified)..."
 	s.Start()
 	defer s.Stop()
+
+	const maxApplyRetries = 5
+	const maintenanceModeRetriggerInterval = 3 * time.Minute
 
 	deadline := time.Now().Add(35 * time.Minute)
 	wait := 5 * time.Second
 	start := time.Now()
 	attempt := 0
 	// Track how long port 50000 has been continuously UP with a cert failure.
-	// If >5 min, re-send apply-config — the first one may have been lost.
+	// When it exceeds maintenanceModeRetriggerInterval, re-send apply-config.
 	var port50kUpSince time.Time
-	applyConfigRetried := false
+	applyRetryCount := 0
+	// Track consecutive iterations where both ports are down (machine stuck).
+	bothPortsDownSince := time.Time{}
 
 	for time.Now().Before(deadline) {
 		attempt++
@@ -282,71 +322,100 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host 
 			port50kUp = true
 		}
 
+		// Also check port 22 (SSH/Ubuntu).
+		port22Up := false
+		if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
+			conn.Close()
+			port22Up = true
+		}
+
 		// Log the actual error every attempt for the first 5, then every 5th.
 		if attempt <= 5 || attempt%5 == 0 {
 			s.Stop()
-			portState := "DOWN (rebooting)"
-			if port50kUp {
-				portState = "UP (maintenance mode / cert mismatch)"
+			var portState string
+			switch {
+			case port50kUp && port22Up:
+				portState = "50000 UP + 22 UP (both open?)"
+			case port50kUp:
+				portState = "50000 UP (maintenance mode / cert mismatch)"
+			case port22Up:
+				portState = "22 UP (Ubuntu is running!)"
+			default:
+				portState = "both DOWN (rebooting / stuck)"
 			}
-			color.Yellow("  [attempt %d, elapsed %s] port 50000: %s\n    talosctl error: %v\n",
+			color.Yellow("  [attempt %d, elapsed %s] ports: %s\n    talosctl error: %v\n",
 				attempt, time.Since(start).Round(time.Second), portState, err)
 			s.Start()
 		}
 
-		// Track consecutive time port 50000 has been UP with cert failure.
+		// ── Fail-fast: Ubuntu SSH is responding ──────────────────────────────
+		// This means the machine rebooted back into Ubuntu rather than Talos.
+		if port22Up && time.Since(start) > 3*time.Minute {
+			s.Stop()
+			color.Yellow("\n  ⚠  Port 22 (SSH) is responding — machine has rebooted back into Ubuntu!\n")
+			color.Yellow("  ⚠  Talos did not boot after the EFI reboot. Failing early.\n")
+			return fmt.Errorf(
+				"machine at %s booted back into Ubuntu instead of Talos "+
+					"(port 22 is responding, port 50000 is not ready after %s)",
+				host, time.Since(start).Round(time.Second),
+			)
+		}
+
+		// ── Fail-fast: both ports closed for >10 minutes ─────────────────────
+		// Suggests the machine is stuck in UEFI shell or GRUB rescue.
+		if !port50kUp && !port22Up {
+			if bothPortsDownSince.IsZero() {
+				bothPortsDownSince = time.Now()
+			} else if time.Since(bothPortsDownSince) > 10*time.Minute {
+				s.Stop()
+				return fmt.Errorf(
+					"machine at %s has been unreachable on both port 22 and port 50000 "+
+						"for >10 minutes (elapsed %s) — likely stuck in UEFI shell or GRUB rescue",
+					host, time.Since(start).Round(time.Second),
+				)
+			}
+		} else {
+			bothPortsDownSince = time.Time{}
+		}
+
+		// ── Maintenance-mode retry: apply-config again ────────────────────────
+		// If port 50000 has been continuously UP (maintenance mode) for longer
+		// than the retry interval, re-send apply-config.  This handles:
+		//   1. The first apply-config was silently dropped or Talos wasn't ready.
+		//   2. The hardware reboot after a previous apply-config returned Talos
+		//      to maintenance mode (EFI path issue or STATE not read).
+		// We allow up to maxApplyRetries retries, one per maintenance window.
 		if port50kUp {
 			if port50kUpSince.IsZero() {
 				port50kUpSince = time.Now()
 			}
-			// If port has been UP (maintenance mode) for >5 min and we
-			// haven't retried yet, re-send apply-config — the first may
-			// have been silently dropped or Talos rejected it.
-			if !applyConfigRetried && time.Since(port50kUpSince) > 5*time.Minute {
-				applyConfigRetried = true
+			if applyRetryCount < maxApplyRetries && time.Since(port50kUpSince) > maintenanceModeRetriggerInterval {
+				applyRetryCount++
 				s.Stop()
-				color.Yellow("  Port 50000 has been up for >5 min with cert errors — " +
-					"retrying apply-config --insecure\n")
+				color.Yellow("  Port 50000 has been in maintenance mode for >%s — "+
+					"retrying apply-config --insecure (attempt %d/%d)\n",
+					maintenanceModeRetriggerInterval, applyRetryCount, maxApplyRetries)
 				s.Start()
-				// Read controlplane.yaml path from BootstrapOptions — we need
-				// the stored path. Re-derive it from talosConfigFile directory.
-				controlPlaneCfg := filepath.Join(filepath.Dir(talosConfigFile), "controlplane.yaml")
+
 				if applyErr := b.runTalosctl(talosctlPath, talosConfigFile,
 					"apply-config", "--insecure",
 					"--nodes", host,
 					"--file", controlPlaneCfg,
 				); applyErr != nil {
 					s.Stop()
-					color.Yellow("  apply-config retry: %v\n", applyErr)
+					color.Yellow("  apply-config retry %d failed: %v\n", applyRetryCount, applyErr)
 					s.Start()
 				} else {
 					s.Stop()
-					color.Green("  ✓ apply-config retry succeeded — waiting for reboot\n")
+					color.Green("  ✓ apply-config retry %d succeeded — waiting for reboot\n", applyRetryCount)
 					s.Start()
 				}
-				// Reset the maintenance-mode timer so we don't re-retry immediately.
+				// Reset the maintenance-mode timer for the next window.
 				port50kUpSince = time.Time{}
 			}
 		} else {
 			// Port is DOWN — machine is rebooting; reset the maintenance-mode timer.
 			port50kUpSince = time.Time{}
-		}
-
-		// After 3 minutes, check if SSH (Ubuntu) is responding.
-		// If it is, the machine booted back into Ubuntu — fail immediately
-		// rather than burning 35 minutes of CI time.
-		if time.Since(start) > 3*time.Minute {
-			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
-				conn.Close()
-				s.Stop()
-				color.Yellow("\n  ⚠  Port 22 (SSH) is responding — machine has rebooted back into Ubuntu!\n")
-				color.Yellow("  ⚠  Talos did not boot after the EFI reboot. Failing early.\n")
-				return fmt.Errorf(
-					"machine at %s booted back into Ubuntu instead of Talos "+
-						"(port 22 is responding, port 50000 is not ready after %s)",
-					host, time.Since(start).Round(time.Second),
-				)
-			}
 		}
 
 		time.Sleep(wait)

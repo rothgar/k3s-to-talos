@@ -251,36 +251,53 @@ jobs:
         if: always()
         run: |
           echo "=== Port connectivity ==="
-          nc -zv "$NODE_IP" 22   -w 3 2>&1 && echo "port 22: OPEN  (Ubuntu SSH)"  || echo "port 22:  CLOSED"
-          nc -zv "$NODE_IP" 50000 -w 3 2>&1 && echo "port 50000: OPEN  (Talos API)" || echo "port 50000: CLOSED"
-          nc -zv "$NODE_IP" 6443  -w 3 2>&1 && echo "port 6443: OPEN  (kube API)"  || echo "port 6443: CLOSED"
+          nc -zv "$NODE_IP" 22    -w 3 2>&1 && echo "port 22:    OPEN  (Ubuntu SSH)"  || echo "port 22:    CLOSED"
+          nc -zv "$NODE_IP" 50000 -w 3 2>&1 && echo "port 50000: OPEN  (Talos API)"   || echo "port 50000: CLOSED"
+          nc -zv "$NODE_IP" 6443  -w 3 2>&1 && echo "port 6443:  OPEN  (kube API)"    || echo "port 6443:  CLOSED"
 
           echo ""
           echo "=== talosctl version --insecure (maintenance-mode probe) ==="
           talosctl version --insecure \
-            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 10s 2>&1 \
-            && echo "RESULT: maintenance mode (insecure endpoint answered)" \
-            || echo "RESULT: not in maintenance mode (or network unreachable)"
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1
+          echo "exit code: $?"
 
           echo ""
           echo "=== talosctl version CA-verified (configured-mode probe) ==="
           TALOSCFG="./test-backup/talos-config/talosconfig"
           if [ -f "$TALOSCFG" ]; then
             talosctl --talosconfig "$TALOSCFG" version \
-              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 10s 2>&1 \
-              && echo "RESULT: configured mode (CA-verified API answered)" \
-              || echo "RESULT: CA-verified API not ready"
+              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1
+            echo "exit code: $?"
           else
-            echo "talosconfig not found at $TALOSCFG (migration may have failed before phase 3)"
+            echo "talosconfig not found at $TALOSCFG"
           fi
 
           echo ""
-          echo "=== talosctl dmesg (last 30 lines, best-effort) ==="
+          echo "=== talosctl dmesg --insecure (kernel ring buffer via maintenance API) ==="
+          talosctl dmesg --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 \
+            | tail -50 || echo "(dmesg --insecure not available)"
+
+          echo ""
+          echo "=== talosctl dmesg CA-verified ==="
           TALOSCFG="./test-backup/talos-config/talosconfig"
           if [ -f "$TALOSCFG" ]; then
             talosctl --talosconfig "$TALOSCFG" dmesg \
-              --nodes "$NODE_IP" --tail 30 --timeout 10s 2>&1 || echo "(dmesg not available)"
+              --nodes "$NODE_IP" --tail 50 --timeout 15s 2>&1 || echo "(dmesg not available)"
           fi
+
+          echo ""
+          echo "=== talosctl logs machined --insecure ==="
+          talosctl logs machined --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 \
+            | tail -50 || echo "(machined logs not available)"
+
+          echo ""
+          echo "=== EC2 serial console (boot log) ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -100 || echo "(no console output)"
 
       # ── Upload backup artefacts for debugging ─────────────────────────────
       - name: Upload backup artefact
