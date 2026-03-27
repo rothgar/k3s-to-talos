@@ -241,6 +241,47 @@ jobs:
             --output text 2>/dev/null || echo "(no console output available yet)"
           echo "=== End Serial Console ==="
 
+      # ── Post-failure diagnostics: what state is the machine in? ───────────
+      # Runs even on success so we always have diagnostic data.
+      # Key questions:
+      #   - Is port 22 (SSH/Ubuntu) or 50000 (Talos API) open?
+      #   - Is Talos in maintenance mode (insecure endpoint responds)?
+      #   - Is Talos in configured mode (CA-verified endpoint responds)?
+      - name: Diagnose machine state
+        if: always()
+        run: |
+          echo "=== Port connectivity ==="
+          nc -zv "$NODE_IP" 22   -w 3 2>&1 && echo "port 22: OPEN  (Ubuntu SSH)"  || echo "port 22:  CLOSED"
+          nc -zv "$NODE_IP" 50000 -w 3 2>&1 && echo "port 50000: OPEN  (Talos API)" || echo "port 50000: CLOSED"
+          nc -zv "$NODE_IP" 6443  -w 3 2>&1 && echo "port 6443: OPEN  (kube API)"  || echo "port 6443: CLOSED"
+
+          echo ""
+          echo "=== talosctl version --insecure (maintenance-mode probe) ==="
+          talosctl version --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 10s 2>&1 \
+            && echo "RESULT: maintenance mode (insecure endpoint answered)" \
+            || echo "RESULT: not in maintenance mode (or network unreachable)"
+
+          echo ""
+          echo "=== talosctl version CA-verified (configured-mode probe) ==="
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          if [ -f "$TALOSCFG" ]; then
+            talosctl --talosconfig "$TALOSCFG" version \
+              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 10s 2>&1 \
+              && echo "RESULT: configured mode (CA-verified API answered)" \
+              || echo "RESULT: CA-verified API not ready"
+          else
+            echo "talosconfig not found at $TALOSCFG (migration may have failed before phase 3)"
+          fi
+
+          echo ""
+          echo "=== talosctl dmesg (last 30 lines, best-effort) ==="
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          if [ -f "$TALOSCFG" ]; then
+            talosctl --talosconfig "$TALOSCFG" dmesg \
+              --nodes "$NODE_IP" --tail 30 --timeout 10s 2>&1 || echo "(dmesg not available)"
+          fi
+
       # ── Upload backup artefacts for debugging ─────────────────────────────
       - name: Upload backup artefact
         if: always()
