@@ -68,9 +68,14 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		inMaintenanceMode := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
 		if inMaintenanceMode {
 			fmt.Println("  Talos is in maintenance mode — applying control plane configuration...")
-			if applyErr := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
-				"apply-config", "--insecure",
+			// Use runTalosctlInsecure (no --talosconfig, no client cert) for
+			// maintenance-mode apply-config.  Maintenance mode does not require
+			// mTLS; passing a client cert from talosconfig can confuse newer
+			// Talos builds that check the cert against a non-existent CA.
+			if applyErr := b.runTalosctlInsecure(talosctlPath,
+				"apply-config",
 				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
 				"--file", opts.ControlPlaneCfg,
 			); applyErr != nil {
 				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
@@ -306,6 +311,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 		port22Up := tcpProbe(host+":22", 3*time.Second)
 
 		// ── Track port-50000 transitions (detect reboots) ─────────────────────
+		justCameUp := port50kUp && !prevPort50kUp // captured before prevPort50kUp is updated
 		if port50kUp && !prevPort50kUp {
 			// Port came back UP after a DOWN period.
 			downDur := ""
@@ -326,6 +332,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 			port50kUpSince = time.Time{}
 		}
 		prevPort50kUp = port50kUp
+
 
 		// Initialise upSince on first iteration if port is already UP.
 		if port50kUp && port50kUpSince.IsZero() {
@@ -391,7 +398,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 		// Also retrigger if the port just came back UP after a DOWN period,
 		// meaning the previous apply-config DID trigger a reboot but Talos is
 		// still in maintenance mode — the config was not persisted.
-		rebootedToMaintenance := port50kUp && !prevPort50kUp // port just came UP
+		rebootedToMaintenance := justCameUp
 
 		shouldRetry := applyRetryCount < maxApplyRetries &&
 			(retriggerDue || rebootedToMaintenance) &&
@@ -415,9 +422,10 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 					return time.Since(port50kUpSince).Round(time.Second).String()
 				}())
 
-			applyOut, applyErr := b.runTalosctlWithOutput(talosctlPath, talosConfigFile,
-				"apply-config", "--insecure",
+			applyOut, applyErr := b.runTalosctlInsecureWithOutput(talosctlPath,
+				"apply-config",
 				"--nodes", host,
+				"--endpoints", host,
 				"--file", controlPlaneCfg,
 			)
 			if applyErr != nil {
@@ -534,6 +542,23 @@ func (b *Bootstrapper) runTalosctlWithOutput(binary, talosconfig string, args ..
 	}
 
 	return out, nil
+}
+
+// runTalosctlInsecureWithOutput runs talosctl with --insecure and returns
+// (combined output, error).  Used for apply-config in maintenance mode.
+func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...string) (string, error) {
+	allArgs := append([]string{"--insecure"}, args...)
+	cmd := exec.Command(binary, allArgs...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		combined := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
+		return combined, fmt.Errorf("%w\n%s", err, combined)
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // runTalosctlInsecure runs talosctl with --insecure (no TLS cert verification,

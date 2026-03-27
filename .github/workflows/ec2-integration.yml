@@ -249,16 +249,19 @@ jobs:
       #   - Is Talos in configured mode (CA-verified endpoint responds)?
       - name: Diagnose machine state
         if: always()
+        # Every talosctl command here may legitimately fail (wrong mode, port
+        # closed, etc).  Use "|| true" so that set -e does not abort the step
+        # prematurely — we want ALL diagnostic sections to run.
         run: |
           echo "=== Port connectivity ==="
-          nc -zv "$NODE_IP" 22    -w 3 2>&1 && echo "port 22:    OPEN  (Ubuntu SSH)"  || echo "port 22:    CLOSED"
-          nc -zv "$NODE_IP" 50000 -w 3 2>&1 && echo "port 50000: OPEN  (Talos API)"   || echo "port 50000: CLOSED"
-          nc -zv "$NODE_IP" 6443  -w 3 2>&1 && echo "port 6443:  OPEN  (kube API)"    || echo "port 6443:  CLOSED"
+          nc -w 3 -zv "$NODE_IP" 22    2>&1 && echo "port 22:    OPEN  (Ubuntu SSH)"  || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$NODE_IP" 50000 2>&1 && echo "port 50000: OPEN  (Talos API)"   || echo "port 50000: CLOSED"
+          nc -w 3 -zv "$NODE_IP" 6443  2>&1 && echo "port 6443:  OPEN  (kube API)"    || echo "port 6443:  CLOSED"
 
           echo ""
           echo "=== talosctl version --insecure (maintenance-mode probe) ==="
           talosctl version --insecure \
-            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
           echo "exit code: $?"
 
           echo ""
@@ -266,7 +269,7 @@ jobs:
           TALOSCFG="./test-backup/talos-config/talosconfig"
           if [ -f "$TALOSCFG" ]; then
             talosctl --talosconfig "$TALOSCFG" version \
-              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1
+              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
             echo "exit code: $?"
           else
             echo "talosconfig not found at $TALOSCFG"
