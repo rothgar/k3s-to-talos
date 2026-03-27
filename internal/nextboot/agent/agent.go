@@ -331,15 +331,18 @@ func writeReaderToDisk(r io.Reader, disk string) error {
 
 // writeConfig mounts the Talos STATE partition and writes config.yaml.
 // Talos GPT layout: EFI(1) BIOS(2) META(3) STATE(4) EPHEMERAL(5).
-// Partition 6 is tried as a fallback for older layouts.
+//
+// We use losetup with exact byte offsets from sfdisk rather than mounting
+// /dev/xvda4 directly.  After overwriting the disk, the kernel's VFS
+// superblock for the old partition-4 device may be stale (same root cause
+// that required losetup for the EFI partition).  losetup goes through the
+// /dev/xvda page cache at the correct offset so we always see the new data.
 func writeConfig(disk string, config []byte) error {
-
-	var candidates []string
-	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") {
-		candidates = []string{disk + "p4", disk + "p6"}
-	} else {
-		candidates = []string{disk + "4", disk + "6"}
+	loopDev, cleanup, err := losetupStatePartition(disk)
+	if err != nil {
+		return fmt.Errorf("setting up loop device for STATE partition: %w", err)
 	}
+	defer cleanup()
 
 	mountPoint, err := os.MkdirTemp("", "talos-state-*")
 	if err != nil {
@@ -347,25 +350,93 @@ func writeConfig(disk string, config []byte) error {
 	}
 	defer os.RemoveAll(mountPoint)
 
-	for _, part := range candidates {
-		if _, err := os.Stat(part); err != nil {
-			continue
-		}
-		if err := exec.Command("mount", part, mountPoint).Run(); err != nil {
-			continue
-		}
-		configPath := filepath.Join(mountPoint, "config.yaml")
-		writeErr := os.WriteFile(configPath, config, 0600)
-		exec.Command("sync").Run()               //nolint:errcheck
-		exec.Command("umount", mountPoint).Run() //nolint:errcheck
-		if writeErr != nil {
-			return fmt.Errorf("writing config to %s: %w", configPath, writeErr)
-		}
-		log("Machine config written to STATE partition (%s).", part)
-		return nil
+	if out, err := exec.Command("mount", loopDev, mountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("mounting STATE loop device %s: %w\n%s", loopDev, err, string(out))
 	}
-	return fmt.Errorf("could not mount STATE partition (tried: %s)",
-		strings.Join(candidates, ", "))
+	defer exec.Command("umount", mountPoint).Run() //nolint:errcheck
+
+	configPath := filepath.Join(mountPoint, "config.yaml")
+	if err := os.WriteFile(configPath, config, 0600); err != nil {
+		return fmt.Errorf("writing config to %s: %w", configPath, err)
+	}
+	exec.Command("sync").Run() //nolint:errcheck
+	log("Machine config written to STATE partition (%s via %s).", disk+"[STATE]", loopDev)
+	return nil
+}
+
+// losetupStatePartition finds the STATE partition (4th in Talos GPT) using
+// sfdisk, then creates a losetup loop device over the exact byte range.
+// This bypasses the kernel's potentially stale per-partition VFS state
+// after the disk was overwritten with a new GPT layout.
+func losetupStatePartition(disk string) (loopDev string, cleanup func(), err error) {
+	cleanup = func() {}
+
+	sfdiskOut, err := exec.Command("sfdisk", "--json", disk).Output()
+	if err != nil {
+		return "", cleanup, fmt.Errorf("sfdisk --json %s: %w", disk, err)
+	}
+
+	var pt struct {
+		PartitionTable struct {
+			SectorSize int64 `json:"sectorsize"`
+			Partitions []struct {
+				Node  string `json:"node"`
+				Start int64  `json:"start"`
+				Size  int64  `json:"size"`
+				Type  string `json:"type"`
+			} `json:"partitions"`
+		} `json:"partitiontable"`
+	}
+	if err := json.Unmarshal(sfdiskOut, &pt); err != nil {
+		return "", cleanup, fmt.Errorf("parsing sfdisk output: %w", err)
+	}
+
+	sectorSize := pt.PartitionTable.SectorSize
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
+
+	// STATE is the 4th partition in Talos GPT.  Match by node suffix "4"
+	// (xvda4, sda4) or "p4" (nvme0n1p4, mmcblk0p4).
+	var stateStart, stateSize int64
+	var stateNode string
+	for _, p := range pt.PartitionTable.Partitions {
+		if strings.HasSuffix(p.Node, "p4") || strings.HasSuffix(p.Node, "4") {
+			stateStart = p.Start
+			stateSize = p.Size
+			stateNode = p.Node
+			break
+		}
+	}
+	// Fallback: 4th partition by array index.
+	if stateStart == 0 && len(pt.PartitionTable.Partitions) >= 4 {
+		p := pt.PartitionTable.Partitions[3]
+		stateStart = p.Start
+		stateSize = p.Size
+		stateNode = p.Node
+		log("STATE partition (fallback index 4): %s start=%d size=%d sectors", stateNode, stateStart, stateSize)
+	}
+	if stateStart == 0 {
+		return "", cleanup, fmt.Errorf("could not find STATE partition (partition 4) in %s", disk)
+	}
+	log("STATE partition: %s start=%d size=%d sectors (%d MiB)",
+		stateNode, stateStart, stateSize, stateSize*sectorSize>>20)
+
+	out, err := exec.Command("losetup", "-f", "--show",
+		fmt.Sprintf("--offset=%d", stateStart*sectorSize),
+		fmt.Sprintf("--sizelimit=%d", stateSize*sectorSize),
+		disk,
+	).Output()
+	if err != nil {
+		return "", cleanup, fmt.Errorf("losetup for STATE: %w", err)
+	}
+	loopDev = strings.TrimSpace(string(out))
+	cleanup = func() {
+		exec.Command("losetup", "-d", loopDev).Run() //nolint:errcheck
+	}
+	log("Created loop device %s → %s offset=%d size=%d bytes",
+		loopDev, disk, stateStart*sectorSize, stateSize*sectorSize)
+	return loopDev, cleanup, nil
 }
 
 // ── kexec boot ───────────────────────────────────────────────────────────────
