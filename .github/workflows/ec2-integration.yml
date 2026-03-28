@@ -698,12 +698,31 @@ jobs:
 
       # Stop k3s-agent before nextboot to free memory and avoid interference.
       # The agent is likely crash-looping since the CP is now Talos (not k3s).
+      #
+      # We use k3s-killall.sh when available because systemctl stop alone leaves
+      # behind the flannel.1 VXLAN interface, cni0, and iptables rules.  The
+      # leftover flannel.1 VTEP can cause MTU-related TCP failures: HTTPS
+      # connections to factory.talos.dev succeed at the TCP/TLS layer but
+      # large response bodies are silently dropped (VXLAN encap reduces the
+      # effective MTU, ICMP "fragmentation needed" is blocked, and TCP MSS is
+      # not re-negotiated).  This manifests as the nextboot agent hanging or
+      # timing out while streaming the Talos disk image.
       - name: Stop k3s-agent on worker
         run: |
           SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
-          $SSH "sudo systemctl stop k3s-agent 2>/dev/null || true"
-          $SSH "sudo systemctl stop k3s 2>/dev/null || true"
-          echo "✓ k3s-agent stopped (or was not running)"
+          # Prefer k3s-killall.sh: removes flannel.1, cni0, and iptables rules.
+          if $SSH "test -f /usr/local/bin/k3s-killall.sh" 2>/dev/null; then
+            echo "Running k3s-killall.sh to fully tear down k3s networking..."
+            $SSH "sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true"
+          else
+            $SSH "sudo systemctl stop k3s-agent 2>/dev/null || true"
+            $SSH "sudo systemctl stop k3s 2>/dev/null || true"
+            # Manually clean up k3s network interfaces to avoid MTU/iptables issues.
+            $SSH "sudo ip link delete flannel.1 2>/dev/null || true"
+            $SSH "sudo ip link delete cni0 2>/dev/null || true"
+            $SSH "sudo ip link delete flannel-wg 2>/dev/null || true"
+          fi
+          echo "✓ k3s-agent stopped and k3s networking torn down"
 
       # Kill unattended-upgrades to release the apt lock before nextboot.
       # The worker machine has been running for ~45 min by this point, long
