@@ -101,7 +101,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		// conversion path in Talos.  Block the migration unless the user passes
 		// --migrate-to-etcd to convert the datastore automatically first.
 		if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" {
-			if !flagMigrateToEtcd {
+			if flagDryRun {
+				// In dry-run mode just warn — no machine changes are made so the
+				// guard is informational only.
+				color.Yellow("\n  ⚠ WARNING: k3s is using SQLite.  A real migration requires\n")
+				color.Yellow("    --migrate-to-etcd to convert to embedded etcd first.\n\n")
+			} else if !flagMigrateToEtcd {
 				return fmt.Errorf(
 					"k3s is using SQLite as its datastore, but Talos requires etcd.\n\n" +
 						"The etcd snapshot restore path used to preserve your workloads only\n" +
@@ -109,10 +114,6 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 						"Re-run with --migrate-to-etcd to automatically convert the datastore\n" +
 						"to embedded etcd before taking the backup.  k3s will be restarted —\n" +
 						"expect a brief API downtime (~30 s).")
-			}
-
-			if flagDryRun {
-				color.Yellow("[DRY RUN] Would convert k3s SQLite → embedded etcd before backup\n")
 			} else {
 				if err := k3s.MigrateToEtcd(sshClient); err != nil {
 					return fmt.Errorf("converting k3s to embedded etcd: %w", err)
