@@ -27,6 +27,12 @@ type ClusterInfo struct {
 	Hardware      *talos.HardwareInfo `json:"hardware,omitempty"`
 	PodCIDR       string              `json:"pod_cidr,omitempty"`     // cluster pod CIDR
 	ServiceCIDR   string              `json:"service_cidr,omitempty"` // cluster service CIDR
+	// AllowSchedulingOnControlPlane is true when the source cluster's control-plane
+	// nodes are schedulable (i.e. none of them carry the
+	// node-role.kubernetes.io/control-plane:NoSchedule taint). The Talos config
+	// generator uses this to set cluster.allowSchedulingOnControlPlane so the
+	// generated cluster has identical scheduling behaviour.
+	AllowSchedulingOnControlPlane bool `json:"allow_scheduling_on_control_plane"`
 }
 
 // Node represents a Kubernetes node in the k3s cluster.
@@ -203,6 +209,12 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 				Name   string            `json:"name"`
 				Labels map[string]string `json:"labels"`
 			} `json:"metadata"`
+			Spec struct {
+				Taints []struct {
+					Key    string `json:"key"`
+					Effect string `json:"effect"`
+				} `json:"taints"`
+			} `json:"spec"`
 			Status struct {
 				Conditions []struct {
 					Type   string `json:"type"`
@@ -219,6 +231,10 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 	if err := json.Unmarshal([]byte(out), &nodeList); err != nil {
 		return fmt.Errorf("parsing node list: %w", err)
 	}
+
+	// Track whether any control-plane node carries the NoSchedule taint.
+	cpNoScheduleCount := 0
+	cpCount := 0
 
 	for _, item := range nodeList.Items {
 		node := Node{Name: item.Metadata.Name}
@@ -258,7 +274,24 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 			}
 		}
 
+		if node.IsControlPlane {
+			cpCount++
+			for _, t := range item.Spec.Taints {
+				if t.Key == "node-role.kubernetes.io/control-plane" && t.Effect == "NoSchedule" {
+					cpNoScheduleCount++
+					break
+				}
+			}
+		}
+
 		info.Nodes = append(info.Nodes, node)
+	}
+
+	// allowSchedulingOnControlPlane = true when there are control-plane nodes
+	// AND none of them carry the NoSchedule taint (i.e. the source cluster
+	// allows scheduling on the control plane).
+	if cpCount > 0 && cpNoScheduleCount == 0 {
+		info.AllowSchedulingOnControlPlane = true
 	}
 
 	return nil

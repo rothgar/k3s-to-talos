@@ -187,13 +187,14 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		talosConfigDir := filepath.Join(flagBackupDir, "talos-config")
 		gen := talos.NewConfigGenerator(flagBackupDir)
 		if err := gen.Generate(talos.GenerateOptions{
-			ClusterName:    clusterName,
-			ControlPlaneIP: flagHost,
-			TalosVersion:   flagTalosVersion,
-			OutputDir:      talosConfigDir,
-			DryRun:         flagDryRun,
-			PodCIDR:        state.ClusterInfo.PodCIDR,
-			ServiceCIDR:    state.ClusterInfo.ServiceCIDR,
+			ClusterName:                   clusterName,
+			ControlPlaneIP:                flagHost,
+			TalosVersion:                  flagTalosVersion,
+			OutputDir:                     talosConfigDir,
+			DryRun:                        flagDryRun,
+			PodCIDR:                       state.ClusterInfo.PodCIDR,
+			ServiceCIDR:                   state.ClusterInfo.ServiceCIDR,
+			AllowSchedulingOnControlPlane: state.ClusterInfo.AllowSchedulingOnControlPlane,
 		}); err != nil {
 			return fmt.Errorf("generating Talos config: %w", err)
 		}

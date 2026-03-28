@@ -25,6 +25,12 @@ type GenerateOptions struct {
 	// Leave empty to use Talos defaults (10.244.0.0/16 / 10.96.0.0/12).
 	PodCIDR     string // e.g. "10.42.0.0/16" (k3s default)
 	ServiceCIDR string // e.g. "10.43.0.0/16" (k3s default)
+	// AllowSchedulingOnControlPlane mirrors the source cluster's control-plane
+	// schedulability.  When true, cluster.allowSchedulingOnControlPlane is added
+	// to the generated controlplane config so that Talos removes the
+	// node-role.kubernetes.io/control-plane:NoSchedule taint, matching the
+	// source cluster's behaviour (e.g. k3s single-node, kubeadm with taint removed).
+	AllowSchedulingOnControlPlane bool
 }
 
 // ConfigGenerator runs talosctl gen config to produce machine configs.
@@ -78,13 +84,19 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 	// JSON6902 patches are not supported for multi-document configs in
 	// talosctl v1.12; we use YAML strategic-merge patches throughout.
 	cpPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
-	if opts.PodCIDR != "" || opts.ServiceCIDR != "" {
-		cpPatch += "cluster:\n  network:\n"
-		if opts.PodCIDR != "" {
-			cpPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", opts.PodCIDR)
+	if opts.PodCIDR != "" || opts.ServiceCIDR != "" || opts.AllowSchedulingOnControlPlane {
+		cpPatch += "cluster:\n"
+		if opts.AllowSchedulingOnControlPlane {
+			cpPatch += "  allowSchedulingOnControlPlane: true\n"
 		}
-		if opts.ServiceCIDR != "" {
-			cpPatch += fmt.Sprintf("    serviceSubnets:\n      - %q\n", opts.ServiceCIDR)
+		if opts.PodCIDR != "" || opts.ServiceCIDR != "" {
+			cpPatch += "  network:\n"
+			if opts.PodCIDR != "" {
+				cpPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", opts.PodCIDR)
+			}
+			if opts.ServiceCIDR != "" {
+				cpPatch += fmt.Sprintf("    serviceSubnets:\n      - %q\n", opts.ServiceCIDR)
+			}
 		}
 	}
 
