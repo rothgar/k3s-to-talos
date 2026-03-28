@@ -239,6 +239,14 @@ jobs:
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          # After etcd restore Talos's kubelet may re-register within ~2 minutes
+          # and re-apply the control-plane taint.  Keep removing it for 90 s to
+          # ensure it stays gone before the pod scheduling check runs.
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
           echo "✓ Control-plane taint removed"
 
       # ── Verify workload survived the migration and is running ─────────────
@@ -602,6 +610,11 @@ jobs:
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
           echo "✓ Control-plane taint removed"
 
       # After migrating from k3s (etcd restore), the Talos bootstrap token
@@ -1025,6 +1038,11 @@ jobs:
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
           echo "✓ Control-plane taint removed"
 
       - name: Verify ci-test-nginx deployment on Talos
@@ -1360,6 +1378,11 @@ jobs:
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
           echo "✓ Control-plane taint removed"
 
       # After migrating from kubeadm (etcd restore), the Talos bootstrap token
