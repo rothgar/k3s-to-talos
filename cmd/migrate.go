@@ -19,11 +19,12 @@ import (
 )
 
 var (
-	flagTalosVersion string
-	flagClusterName  string
-	flagDryRun       bool
-	flagResume       bool
-	flagYes          bool
+	flagTalosVersion    string
+	flagClusterName     string
+	flagDryRun          bool
+	flagResume          bool
+	flagYes             bool
+	flagMigrateToEtcd   bool
 )
 
 var migrateCmd = &cobra.Command{
@@ -48,6 +49,7 @@ func init() {
 	migrateCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "Collect info and show what would happen, but do not modify the remote machine")
 	migrateCmd.Flags().BoolVar(&flagResume, "resume", false, "Resume a previously interrupted migration from the last completed phase")
 	migrateCmd.Flags().BoolVar(&flagYes, "yes", false, "Skip the interactive confirmation prompt (for CI/automation)")
+	migrateCmd.Flags().BoolVar(&flagMigrateToEtcd, "migrate-to-etcd", false, "Automatically convert the k3s SQLite datastore to embedded etcd before backup (requires k3s restart)")
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
@@ -92,6 +94,49 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		info, err := collector.Collect()
 		if err != nil {
 			return fmt.Errorf("collecting k3s info: %w", err)
+		}
+
+		// ── SQLite guard ─────────────────────────────────────────────────────
+		// Talos bootstrap uses etcd snapshot restore; there is no SQLite→etcd
+		// conversion path in Talos.  Block the migration unless the user passes
+		// --migrate-to-etcd to convert the datastore automatically first.
+		if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" {
+			if !flagMigrateToEtcd {
+				return fmt.Errorf(
+					"k3s is using SQLite as its datastore, but Talos requires etcd.\n\n" +
+						"The etcd snapshot restore path that this tool uses to preserve your\n" +
+						"workloads only works when k3s is running with embedded etcd.\n\n" +
+						"Options:\n" +
+						"  1. Re-run with --migrate-to-etcd to automatically convert the\n" +
+						"     datastore to embedded etcd before taking the backup.\n" +
+						"     This restarts k3s — expect a brief API downtime.\n\n" +
+						"  2. Convert manually: add '--cluster-init' to the k3s ExecStart,\n" +
+						"     restart k3s, wait for etcd/member to appear, then remove the flag\n" +
+						"     and restart again.  Then re-run this command.\n\n" +
+						"  3. Proceed without a workload restore: the YAML resource backup will\n" +
+						"     still be taken and can be applied manually after migration, but\n" +
+						"     in-cluster state (e.g. PV data) will not be preserved.")
+			}
+
+			if flagDryRun {
+				color.Yellow("[DRY RUN] Would convert k3s SQLite → embedded etcd before backup\n")
+			} else {
+				if err := k3s.MigrateToEtcd(sshClient); err != nil {
+					return fmt.Errorf("converting k3s to embedded etcd: %w", err)
+				}
+				// Re-collect after the datastore migration so info reflects the new state.
+				collector2, err2 := k3s.Detect(sshClient)
+				if err2 != nil {
+					return fmt.Errorf("re-detecting cluster type after etcd migration: %w", err2)
+				}
+				info, err = collector2.Collect()
+				if err != nil {
+					return fmt.Errorf("re-collecting cluster info after etcd migration: %w", err)
+				}
+				if info.DatastoreType != "etcd" {
+					return fmt.Errorf("k3s still reports SQLite after --cluster-init migration; check k3s logs")
+				}
+			}
 		}
 
 		backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
