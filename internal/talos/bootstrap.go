@@ -150,6 +150,7 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
 		"kubeconfig",
 		"--nodes", opts.Host,
+		"--endpoints", opts.Host,
 		"--force",
 		"--merge=false",
 		opts.KubeconfigOut,
