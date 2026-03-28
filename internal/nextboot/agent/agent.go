@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -144,7 +146,16 @@ func Run(opts Options) error {
 		log("Disk layout before imaging:\n%s", strings.TrimSpace(string(out)))
 	}
 
+	// Disable GC for the duration of the disk write.  The write streams 188 MiB
+	// through many small buffers, triggering frequent GC assists.  In Go 1.21,
+	// if a GC cycle is still in progress when we later call fork+exec (or even
+	// allocate), the GC phase may be inconsistent, causing fatal errors like
+	// "gcDrainN phase incorrect" or "gcmarknewobject called while doing checkmark".
+	// Disabling GC for the write window prevents partial GC cycles from forming.
+	prevGCPercent := debug.SetGCPercent(-1)
+
 	if err := streamImageToDisk(opts.ImageURL, opts.ImageHash, disk); err != nil {
+		debug.SetGCPercent(prevGCPercent)
 		return fmt.Errorf("imaging disk: %w", err)
 	}
 	log("Disk write complete.")
@@ -168,6 +179,13 @@ func Run(opts Options) error {
 	// can trigger a Go GC invariant violation in Go 1.21 when GC is mid-phase).
 	syscall.Syscall(syscall.SYS_SYNC, 0, 0, 0) //nolint:errcheck
 	log("Disk sync complete.")
+
+	// Re-enable GC and run a full synchronous cycle to drain all garbage
+	// accumulated during the disk write.  This ensures the GC phase is in a
+	// clean state before we issue any fork+exec calls below.
+	debug.SetGCPercent(prevGCPercent)
+	runtime.GC()
+	log("GC drain complete.")
 
 	// Relocate the backup GPT header to the end of the disk.  The Talos
 	// metal raw image was designed for a ~200 MB disk; when written to a
