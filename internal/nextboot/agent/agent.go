@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -364,10 +365,40 @@ func ensureTool(name string) error {
 // writes the decompressed bytes to the disk device.  Decompression is done by
 // an external process (zstd / xz) that reads from a Go io.Pipe, so only a
 // small in-memory buffer is required — no large temp files are needed.
+// imageHTTPClient is a shared HTTP client with explicit timeouts for disk
+// image downloads.  The dial and TLS timeouts are set conservatively (30 s)
+// so that a transiently unreachable host fails fast instead of blocking for
+// the default ~60 s Go idle-connection timeout.  ResponseHeaderTimeout is
+// generous (90 s) to accommodate slow factory.talos.dev redirects; the
+// actual body download is unbounded (set via the Body reader itself).
+var imageHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 90 * time.Second,
+	},
+}
+
 func streamImageToDisk(imageURL, imageHash, disk string) error {
-	resp, err := http.Get(imageURL) //nolint:noctx
+	// Retry up to 3 times with a 15 s delay; transient DNS/TCP failures on
+	// fresh EC2 worker instances have been observed in CI.
+	const maxAttempts = 3
+	const retryDelay = 15 * time.Second
+
+	var resp *http.Response
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err = imageHTTPClient.Get(imageURL) //nolint:noctx
+		if err == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			log("HTTP GET attempt %d/%d failed: %v — retrying in %s...", attempt, maxAttempts, err, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("HTTP GET: %w", err)
+		return fmt.Errorf("HTTP GET (after %d attempts): %w", maxAttempts, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

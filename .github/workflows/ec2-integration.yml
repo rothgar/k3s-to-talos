@@ -739,6 +739,19 @@ jobs:
           $SSH "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q zstd efibootmgr gdisk 2>/dev/null || true"
           echo "✓ unattended-upgrades killed and tools pre-installed"
 
+      # ── Verify worker internet connectivity before nextboot ─────────────
+      - name: Verify worker internet connectivity
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "=== Checking worker internet connectivity ==="
+          $SSH "curl -sI --max-time 15 https://factory.talos.dev 2>&1 | head -5 || echo 'factory.talos.dev unreachable — agent will retry 3x'" || true
+          echo "=== DNS resolution ==="
+          $SSH "nslookup factory.talos.dev 2>&1 || dig factory.talos.dev +short 2>&1 || echo 'DNS lookup failed'" || true
+          echo "=== Default route ==="
+          $SSH "ip route show default" || true
+          echo "=== /etc/resolv.conf ==="
+          $SSH "cat /etc/resolv.conf" || true
+
       # ── Migrate worker node ───────────────────────────────────────────────
       - name: Run join-worker (worker node)
         run: |
