@@ -56,30 +56,35 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 
 	endpoint := fmt.Sprintf("https://%s:6443", opts.ControlPlaneIP)
 
-	// Strategic-merge patch applied to all generated machine configs.
+	// machine.certSANs patch (applied to controlplane only via
+	// --config-patch-control-plane).
 	//
-	// machine.certSANs — add the public IP so that CA-verified talosctl calls
-	// via the public IP succeed after config is applied.  On EC2 (and other
-	// cloud providers) the public IP is not on any interface, so Talos would
-	// not auto-include it in the machined TLS cert SANs.
+	// On EC2 (and other cloud providers) the public IP is not on any network
+	// interface, so Talos would not auto-include it in the machined TLS server
+	// cert SANs.  This causes CA-verified talosctl calls via the public IP to
+	// fail with an x509 SAN mismatch.
 	//
-	// cluster.network — use the source cluster's pod/service CIDRs.  After
-	// etcd restore, Flannel finds its existing network config (stored by the
-	// source cluster in etcd) and refuses to switch to a different CIDR.
-	// Setting the same CIDRs avoids CNI failures that leave pods in
-	// ContainerCreating indefinitely.  JSON6902 patches are not supported for
-	// multi-document configs in talosctl v1.12, so we use a YAML
-	// strategic-merge patch.
-	podCIDR := opts.PodCIDR
-	serviceCIDR := opts.ServiceCIDR
-	configPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
-	if podCIDR != "" || serviceCIDR != "" {
-		configPatch += "cluster:\n  network:\n"
-		if podCIDR != "" {
-			configPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", podCIDR)
+	// cluster.network patch — use the source cluster's pod/service CIDRs so
+	// that Flannel's network config in etcd is consistent with what
+	// kube-controller-manager configures.  After etcd restore, Flannel reads
+	// the old network config from etcd and crashes if the CIDR differs from
+	// the Talos-configured value, leaving pods stuck in ContainerCreating.
+	//
+	// Both patches are applied only to controlplane.yaml
+	// (--config-patch-control-plane) so that the worker.yaml is not touched:
+	// worker configs have no cluster.network section, and the worker's own
+	// certSANs are injected later at apply-config time (BootstrapWorker).
+	//
+	// JSON6902 patches are not supported for multi-document configs in
+	// talosctl v1.12; we use YAML strategic-merge patches throughout.
+	cpPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
+	if opts.PodCIDR != "" || opts.ServiceCIDR != "" {
+		cpPatch += "cluster:\n  network:\n"
+		if opts.PodCIDR != "" {
+			cpPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", opts.PodCIDR)
 		}
-		if serviceCIDR != "" {
-			configPatch += fmt.Sprintf("    serviceSubnets:\n      - %q\n", serviceCIDR)
+		if opts.ServiceCIDR != "" {
+			cpPatch += fmt.Sprintf("    serviceSubnets:\n      - %q\n", opts.ServiceCIDR)
 		}
 	}
 
@@ -89,7 +94,7 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 		endpoint,
 		"--output", opts.OutputDir,
 		"--output-types", "controlplane,worker,talosconfig",
-		"--config-patch", configPatch,
+		"--config-patch-control-plane", cpPatch,
 		"--force",
 	}
 
