@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/k3s"
 	"github.com/rothgar/k3s-to-talos/internal/ssh"
 	"github.com/rothgar/k3s-to-talos/internal/ui"
 	"github.com/spf13/cobra"
 )
+
+var flagCollectMigrateToEtcd bool
 
 var collectCmd = &cobra.Command{
 	Use:   "collect",
@@ -18,8 +21,15 @@ including nodes, workloads, secrets, configmaps, and persistent volumes.
 Also backs up the k3s database (etcd snapshot or SQLite file) and exports
 all Kubernetes resources as YAML.
 
-This command does NOT modify the remote machine — it is safe to run at any time.`,
+By default this command does NOT modify the remote machine.  When
+--migrate-to-etcd is set the k3s datastore is converted from SQLite to
+embedded etcd before the backup is taken; this restarts k3s briefly.`,
 	RunE: runCollect,
+}
+
+func init() {
+	collectCmd.Flags().BoolVar(&flagCollectMigrateToEtcd, "migrate-to-etcd", false,
+		"Convert the k3s SQLite datastore to embedded etcd before backup (requires k3s restart)")
 }
 
 func runCollect(cmd *cobra.Command, args []string) error {
@@ -52,6 +62,32 @@ func runCollect(cmd *cobra.Command, args []string) error {
 	info, err := collector.Collect()
 	if err != nil {
 		return fmt.Errorf("collecting k3s info: %w", err)
+	}
+
+	// SQLite guard — same logic as migrate.go.
+	if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" {
+		if !flagCollectMigrateToEtcd {
+			return fmt.Errorf(
+				"k3s is using SQLite as its datastore.\n\n" +
+					"An etcd backup cannot be taken from a SQLite cluster.  Run with\n" +
+					"--migrate-to-etcd to convert the datastore to embedded etcd first,\n" +
+					"or use this backup only for the YAML resource export (resources/ dir).")
+		}
+		if err := k3s.MigrateToEtcd(sshClient); err != nil {
+			return fmt.Errorf("converting k3s to embedded etcd: %w", err)
+		}
+		collector2, err2 := k3s.Detect(sshClient)
+		if err2 != nil {
+			return fmt.Errorf("re-detecting cluster type after etcd migration: %w", err2)
+		}
+		info, err = collector2.Collect()
+		if err != nil {
+			return fmt.Errorf("re-collecting cluster info after etcd migration: %w", err)
+		}
+		if info.DatastoreType != "etcd" {
+			return fmt.Errorf("k3s still reports SQLite after --cluster-init migration; check k3s logs")
+		}
+		color.Green("  ✓ Datastore converted to embedded etcd\n")
 	}
 
 	backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)

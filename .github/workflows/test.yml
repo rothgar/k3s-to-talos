@@ -207,3 +207,101 @@ jobs:
           name: dry-run-backup
           path: dry-run-backup/
           retention-days: 3
+
+  # ── Integration: SQLite → etcd conversion ───────────────────────────────────
+  # Installs k3s under systemd (SQLite mode), deploys a test workload, then
+  # runs `collect --migrate-to-etcd`.  Verifies:
+  #   • k3s converts from SQLite to embedded etcd without data loss
+  #   • The etcd snapshot backup is written (not state.db)
+  #   • The test workload is present in the YAML resource export
+  integration-sqlite-to-etcd:
+    name: Integration — SQLite → etcd conversion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: go build -o k3s-to-talos .
+
+      - name: Install k3s with systemd (SQLite mode)
+        # Install without --cluster-init so k3s starts in SQLite mode.
+        # The installer registers k3s as a systemd service, which is required
+        # for --migrate-to-etcd (it uses systemctl to restart k3s).
+        run: |
+          curl -sfL https://get.k3s.io | \
+            INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb" \
+            sh -
+          # Wait for k3s to be Ready before deploying workloads.
+          echo "Waiting for k3s node to be Ready..."
+          timeout 120 bash -c \
+            'until sudo k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 3; done'
+          sudo k3s kubectl get nodes
+
+      - name: Deploy test workload (nginx)
+        run: |
+          sudo k3s kubectl create deployment ci-test-nginx \
+            --image=nginx:alpine --replicas=1
+          echo "Waiting for nginx pod to be Running..."
+          timeout 120 bash -c \
+            'until sudo k3s kubectl get pods -l app=ci-test-nginx \
+               --no-headers 2>/dev/null | grep -q "Running"; do sleep 3; done'
+          sudo k3s kubectl get pods -l app=ci-test-nginx
+
+      - name: Set up SSH to localhost
+        run: |
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N ""
+          sudo mkdir -p /root/.ssh
+          sudo bash -c "cat $HOME/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys"
+          sudo chmod 600 /root/.ssh/authorized_keys
+          ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
+          ssh -i "$HOME/.ssh/id_ed25519" root@127.0.0.1 "uname -m"
+
+      - name: Run collect --migrate-to-etcd
+        run: |
+          ./k3s-to-talos collect \
+            --host 127.0.0.1 \
+            --ssh-user root \
+            --ssh-key "$HOME/.ssh/id_ed25519" \
+            --backup-dir ./etcd-backup \
+            --migrate-to-etcd
+
+      - name: Verify etcd backup and workload export
+        run: |
+          echo "=== Backup contents ==="
+          find etcd-backup -type f | sort
+
+          echo "=== Assertions ==="
+
+          # Must have etcd snapshot, not SQLite file.
+          test -f etcd-backup/database/etcd-snapshot.db \
+            && echo "✓ etcd snapshot present" \
+            || { echo "✗ etcd snapshot missing"; exit 1; }
+          test ! -f etcd-backup/database/state.db \
+            && echo "✓ SQLite state.db not present (converted)" \
+            || echo "⚠ state.db still present alongside etcd snapshot"
+
+          test -f etcd-backup/database/backup-info.json \
+            && echo "✓ backup metadata present"
+
+          # Resource export must include the nginx deployment.
+          grep -rl "ci-test-nginx" etcd-backup/resources/ \
+            && echo "✓ nginx workload found in resource export" \
+            || { echo "✗ nginx workload missing from resource export"; exit 1; }
+
+          echo "All assertions passed."
+
+      - name: Upload backup as artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-to-etcd-backup
+          path: etcd-backup/
+          retention-days: 3
