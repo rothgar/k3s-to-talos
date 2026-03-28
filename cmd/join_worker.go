@@ -3,7 +3,9 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/nextboot"
@@ -121,41 +123,82 @@ func runJoinWorker(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// patchWorkerConfigCertSANs reads the worker machine config at cfgPath, adds
-// host to machine.certSANs (creating the list if absent), writes the result to
-// a temp file, and returns (tempPath, cleanupFn, error).
+// patchWorkerConfigCertSANs adds host to machine.certSANs in the worker
+// machine config, writes the result to a temp file, and returns
+// (tempPath, cleanupFn, error).
 //
 // The temp file is needed because the nextboot agent writes whatever config it
 // receives to the Talos STATE partition before the hardware reboot.  When Talos
 // boots it reads the config from STATE and uses it to generate machined's TLS
 // cert — so certSANs must be present in the file written to STATE, not injected
 // later via apply-config (which is skipped when Talos boots in configured mode).
+//
+// Strategy:
+//   1. Try "talosctl machineconfig patch" (uses the official Talos config parser)
+//   2. Fall back to sigs.k8s.io/yaml round-trip (pure-Go, no external tool)
+//
+// Both approaches are verified: the output file is re-parsed to confirm host
+// appears in machine.certSANs before returning.
 func patchWorkerConfigCertSANs(cfgPath, host string) (string, func(), error) {
+	patchYAML := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", host)
+
+	tmp, err := os.CreateTemp("", "worker-patched-*.yaml")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("creating temp config: %w", err)
+	}
+	tmp.Close()
+	cleanup := func() { os.Remove(tmp.Name()) }
+
+	var patchErr error
+
+	// Approach 1: talosctl machineconfig patch (uses official Talos config parser)
+	if talosctlPath, lookErr := exec.LookPath("talosctl"); lookErr == nil {
+		out, cmdErr := exec.Command(talosctlPath, "machineconfig", "patch", cfgPath,
+			"--patch", patchYAML,
+			"--output", tmp.Name(),
+		).CombinedOutput()
+		if cmdErr == nil {
+			if verifyErr := verifyCertSANs(tmp.Name(), host); verifyErr == nil {
+				fmt.Printf("  ✓ worker.yaml patched via talosctl (certSANs=[%s])\n", host)
+				return tmp.Name(), cleanup, nil
+			} else {
+				patchErr = fmt.Errorf("talosctl patch produced output missing certSANs: %w", verifyErr)
+				color.Yellow("  Warning: %v\n", patchErr)
+			}
+		} else {
+			patchErr = fmt.Errorf("talosctl machineconfig patch: %w\n%s", cmdErr, strings.TrimSpace(string(out)))
+			color.Yellow("  Warning: %v\n", patchErr)
+		}
+	}
+
+	// Approach 2: sigs.k8s.io/yaml round-trip
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
+		cleanup()
 		return "", func() {}, fmt.Errorf("reading worker config: %w", err)
 	}
 
-	// Unmarshal into a generic map so we can splice in certSANs without
-	// knowing the full Talos schema.
 	var cfg map[string]interface{}
 	if err := sigyaml.Unmarshal(data, &cfg); err != nil {
+		cleanup()
 		return "", func() {}, fmt.Errorf("parsing worker config: %w", err)
 	}
 
-	// Navigate / create machine → certSANs.
 	machine, _ := cfg["machine"].(map[string]interface{})
 	if machine == nil {
 		machine = make(map[string]interface{})
 		cfg["machine"] = machine
 	}
 
-	// Build the SANs list, deduplicating if host is already present.
+	// Build SANs list, deduplicating if host is already present.
 	var sans []interface{}
 	if existing, ok := machine["certSANs"].([]interface{}); ok {
 		for _, e := range existing {
 			if s, _ := e.(string); s == host {
-				// Already present — no change needed; return original file.
+				// Already present — verify and use original file.
+				_ = patchErr // suppress unused warning
+				fmt.Printf("  ✓ certSANs=[%s] already present in worker.yaml\n", host)
+				cleanup()
 				return cfgPath, func() {}, nil
 			}
 			sans = append(sans, e)
@@ -166,19 +209,44 @@ func patchWorkerConfigCertSANs(cfgPath, host string) (string, func(), error) {
 
 	patched, err := sigyaml.Marshal(cfg)
 	if err != nil {
+		cleanup()
 		return "", func() {}, fmt.Errorf("marshaling patched worker config: %w", err)
 	}
 
-	tmp, err := os.CreateTemp("", "worker-patched-*.yaml")
-	if err != nil {
-		return "", func() {}, fmt.Errorf("creating temp config: %w", err)
-	}
-	if _, err := tmp.Write(patched); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+	if err := os.WriteFile(tmp.Name(), patched, 0600); err != nil {
+		cleanup()
 		return "", func() {}, fmt.Errorf("writing patched config: %w", err)
 	}
-	tmp.Close()
 
-	return tmp.Name(), func() { os.Remove(tmp.Name()) }, nil
+	if err := verifyCertSANs(tmp.Name(), host); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("yaml round-trip failed to inject certSANs: %w", err)
+	}
+
+	fmt.Printf("  ✓ worker.yaml patched via yaml round-trip (certSANs=[%s])\n", host)
+	return tmp.Name(), cleanup, nil
+}
+
+// verifyCertSANs re-parses the YAML at path and confirms host is present in
+// machine.certSANs.
+func verifyCertSANs(path, host string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading patched config: %w", err)
+	}
+	var cfg map[string]interface{}
+	if err := sigyaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parsing patched config: %w", err)
+	}
+	machine, _ := cfg["machine"].(map[string]interface{})
+	if machine == nil {
+		return fmt.Errorf("machine section missing")
+	}
+	sans, _ := machine["certSANs"].([]interface{})
+	for _, s := range sans {
+		if str, _ := s.(string); str == host {
+			return nil
+		}
+	}
+	return fmt.Errorf("host %s not found in certSANs %v", host, sans)
 }

@@ -220,7 +220,30 @@ func (b *Bootstrapper) BootstrapWorker(opts WorkerBootstrapOptions) error {
 				color.Green("  ✓ Worker config applied — waiting for reboot\n")
 			}
 		} else {
-			fmt.Println("  Maintenance-mode endpoint not responding — proceeding to gRPC readiness check.")
+			// Maintenance mode endpoint is NOT responding.  The machine is likely
+			// in configured mode but machined's TLS cert is missing the public IP
+			// in SANs (so the CA-verified check above also failed).
+			//
+			// Recovery: use the talosconfig client cert (satisfies machined's
+			// mTLS requirement) while skipping server-cert verification (--insecure)
+			// to work around the SAN mismatch.  If apply-config succeeds, the
+			// machine reboots with the updated certSANs and the CA-verified check
+			// in waitForTalosctlReady will then succeed.
+			fmt.Println("  Maintenance-mode endpoint not responding — machine may be configured without public-IP certSANs.")
+			fmt.Println("  Attempting apply-config with talosconfig+insecure to inject certSANs...")
+			if _, applyErr := b.runTalosctlWithOutput(talosctlPath, opts.TalosConfigFile,
+				"apply-config",
+				"--insecure",
+				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
+				"--file", opts.WorkerCfgFile,
+				"--patch", certSANsPatch,
+			); applyErr != nil {
+				color.Yellow("  apply-config (talosconfig+insecure) returned an error: %v\n", summariseError(applyErr))
+				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
+			} else {
+				color.Green("  ✓ apply-config (talosconfig+insecure) accepted — Talos will reboot with certSANs\n")
+			}
 		}
 	}
 
@@ -511,9 +534,31 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 			}
 			applyOut, applyErr := b.runTalosctlInsecureWithOutput(talosctlPath, applyArgs...)
 			if applyErr != nil {
-				color.Yellow("  apply-config retry %d FAILED: %v\n", applyRetryCount, summariseError(applyErr))
+				color.Yellow("  apply-config retry %d (insecure, no talosconfig) FAILED: %v\n",
+					applyRetryCount, summariseError(applyErr))
 				if applyOut != "" {
 					color.Yellow("  apply-config output: %s\n", applyOut)
+				}
+				// Insecure-only attempt failed (machine may be in configured mode
+				// requiring mTLS).  Try again with talosconfig (provides client cert)
+				// but --insecure (skip server cert verification, works around SANs).
+				if talosConfigFile != "" {
+					tcArgs := make([]string, len(applyArgs))
+					copy(tcArgs, applyArgs)
+					// Insert --insecure after the subcommand name.
+					insecureArgs := append([]string{tcArgs[0], "--insecure"}, tcArgs[1:]...)
+					tcOut, tcErr := b.runTalosctlWithOutput(talosctlPath, talosConfigFile, insecureArgs...)
+					if tcErr != nil {
+						color.Yellow("  apply-config retry %d (talosconfig+insecure) FAILED: %v\n",
+							applyRetryCount, summariseError(tcErr))
+						if tcOut != "" {
+							color.Yellow("  apply-config output: %s\n", tcOut)
+						}
+					} else {
+						color.Green("  ✓ apply-config retry %d (talosconfig+insecure) succeeded — waiting for reboot\n",
+							applyRetryCount)
+						applyErr = nil
+					}
 				}
 			} else {
 				color.Green("  ✓ apply-config retry %d succeeded — waiting for reboot\n", applyRetryCount)
