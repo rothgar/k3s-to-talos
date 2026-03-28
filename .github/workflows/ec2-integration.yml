@@ -617,36 +617,30 @@ jobs:
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
 
-          # Extract cluster token from worker.yaml.
-          TOKEN=$(python3 -c "
-import yaml, sys
-with open('test-backup/talos-config/worker.yaml') as f:
-    cfg = yaml.safe_load(f)
-tok = cfg.get('cluster', {}).get('token', '')
-if not tok:
-    sys.exit(1)
-print(tok)
-" 2>/dev/null) || { echo "Warning: could not parse cluster token — worker join may fail"; exit 0; }
+          # Extract cluster token from worker.yaml (one-liner avoids YAML indent issues).
+          TOKEN=$(python3 -c "import yaml,sys; cfg=yaml.safe_load(open('test-backup/talos-config/worker.yaml')); tok=cfg.get('cluster',{}).get('token',''); tok or sys.exit(1); print(tok)" \
+            2>/dev/null) || { echo "Warning: could not parse cluster token — worker join may fail"; exit 0; }
 
           TOKEN_ID="${TOKEN%%.*}"
           TOKEN_SECRET="${TOKEN##*.}"
           echo "Cluster token ID: ${TOKEN_ID} (secret length: ${#TOKEN_SECRET})"
 
           # Create bootstrap token Secret (stringData → kube base64-encodes it).
-          kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: bootstrap-token-${TOKEN_ID}
-  namespace: kube-system
-type: bootstrap.kubernetes.io/token
-stringData:
-  token-id: "${TOKEN_ID}"
-  token-secret: "${TOKEN_SECRET}"
-  usage-bootstrap-authentication: "true"
-  usage-bootstrap-signing: "true"
-  auth-extra-groups: "system:bootstrappers:kubernetes"
-EOF
+          # Use printf to avoid YAML-in-YAML heredoc indentation issues.
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Secret' \
+            'metadata:' \
+            "  name: bootstrap-token-${TOKEN_ID}" \
+            '  namespace: kube-system' \
+            'type: bootstrap.kubernetes.io/token' \
+            'stringData:' \
+            "  token-id: ${TOKEN_ID}" \
+            "  token-secret: ${TOKEN_SECRET}" \
+            '  usage-bootstrap-authentication: "true"' \
+            '  usage-bootstrap-signing: "true"' \
+            '  auth-extra-groups: "system:bootstrappers:kubernetes"' \
+            | kubectl apply -f -
 
           # Ensure the bootstrappers group can submit CSRs.
           # system:node-bootstrapper is a built-in ClusterRole; the binding may
