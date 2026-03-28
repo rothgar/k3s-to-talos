@@ -604,6 +604,34 @@ jobs:
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
           echo "✓ Control-plane taint removed"
 
+      # ── Pre-flight diagnostics: worker state before nextboot ─────────────
+      - name: Worker pre-flight diagnostics
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "=== Worker disk layout ==="
+          $SSH "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT" || true
+          echo "=== Worker boot device ==="
+          $SSH "findmnt /" || true
+          echo "=== Worker UEFI NVRAM (before nextboot) ==="
+          $SSH "sudo efibootmgr -v 2>&1 || echo 'efibootmgr not available/installed'" || true
+          echo "=== Worker efivarfs mount ==="
+          $SSH "mount | grep efi || echo 'no efi mounts found'" || true
+          echo "=== Worker DMI sys_vendor ==="
+          $SSH "cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo 'not found'" || true
+          echo "=== Worker k3s-agent status ==="
+          $SSH "systemctl is-active k3s-agent 2>/dev/null || echo 'inactive/not-found'" || true
+          echo "=== Worker free memory ==="
+          $SSH "free -h" || true
+
+      # Stop k3s-agent before nextboot to free memory and avoid interference.
+      # The agent is likely crash-looping since the CP is now Talos (not k3s).
+      - name: Stop k3s-agent on worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          $SSH "sudo systemctl stop k3s-agent 2>/dev/null || true"
+          $SSH "sudo systemctl stop k3s 2>/dev/null || true"
+          echo "✓ k3s-agent stopped (or was not running)"
+
       # ── Migrate worker node ───────────────────────────────────────────────
       - name: Run join-worker (worker node)
         run: |
@@ -618,6 +646,17 @@ jobs:
             --talosconfig ./test-backup/talos-config/talosconfig \
             --backup-dir ./test-backup \
           2>&1 | tee test-backup/migrate-worker.log
+
+      # ── Show worker migration log inline (visible without downloading artifact)
+      - name: Show worker migration log
+        if: always()
+        run: |
+          echo "=== migrate-worker.log ==="
+          cat test-backup/migrate-worker.log 2>/dev/null || echo "(log not found — join-worker may not have started)"
+          echo ""
+          echo "=== Worker port status after join-worker ==="
+          nc -w 3 -zv "$WORKER_IP" 22    2>&1 && echo "port 22:    OPEN"    || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$WORKER_IP" 50000 2>&1 && echo "port 50000: OPEN" || echo "port 50000: CLOSED"
 
       # ── Verify both nodes are Talos and workload is running ───────────────
       - name: Verify both nodes are Talos
