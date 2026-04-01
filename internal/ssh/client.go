@@ -99,6 +99,22 @@ func (c *Client) Run(cmd string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// RunNoSudo executes a command without the sudo prefix, regardless of the
+// Sudo option.  Use for read-only detection checks that work without root.
+func (c *Client) RunNoSudo(cmd string) (string, error) {
+	sess, err := c.client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("creating SSH session: %w", err)
+	}
+	defer sess.Close()
+
+	out, err := sess.CombinedOutput(cmd)
+	if err != nil {
+		return string(out), fmt.Errorf("running %q: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // RunStream executes a command and streams stdout/stderr to the provided writers.
 func (c *Client) RunStream(cmd string, stdout, stderr io.Writer) error {
 	sess, err := c.client.NewSession()
