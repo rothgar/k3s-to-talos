@@ -762,6 +762,10 @@ func (b *Bootstrapper) runTalosctlWithOutput(binary, talosconfig string, args ..
 //
 // --insecure is a subcommand-level flag in talosctl v1.12+, so it must be
 // placed after the subcommand name (args[0]), not as a global flag.
+//
+// TALOSCONFIG is set to /dev/null so talosctl cannot load ~/.talos/config or
+// any other default config.  Credentials from a previous migration would
+// cause the TLS handshake to fail in maintenance mode.
 func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...string) (string, error) {
 	// Insert --insecure after the subcommand name (first arg).
 	var allArgs []string
@@ -771,6 +775,7 @@ func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...stri
 		allArgs = []string{"--insecure"}
 	}
 	cmd := exec.Command(binary, allArgs...)
+	cmd.Env = append(os.Environ(), "TALOSCONFIG=/dev/null")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -788,13 +793,12 @@ func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...stri
 //
 // --insecure is a subcommand-level flag in talosctl v1.12+, so it must be
 // placed after the subcommand name (args[0]), not as a global flag.
+//
+// TALOSCONFIG is set to /dev/null so talosctl cannot load ~/.talos/config or
+// any other default config.  Credentials from a previous migration would
+// cause the TLS handshake to fail in maintenance mode, making the probe
+// return false even when the node is genuinely in maintenance mode.
 func (b *Bootstrapper) runTalosctlInsecure(binary string, args ...string) error {
-	// NOTE: deliberately does NOT pass --talosconfig so that no client cert is
-	// presented and no CA verification is attempted.  The maintenance-mode
-	// endpoint does not require auth, so a plain --insecure call is sufficient.
-	// In configured mode, this call will FAIL (server requires client cert).
-	//
-	// Insert --insecure after the subcommand name (first arg).
 	var allArgs []string
 	if len(args) > 0 {
 		allArgs = append(append([]string{args[0], "--insecure"}, args[1:]...))
@@ -802,6 +806,7 @@ func (b *Bootstrapper) runTalosctlInsecure(binary string, args ...string) error 
 		allArgs = []string{"--insecure"}
 	}
 	cmd := exec.Command(binary, allArgs...)
+	cmd.Env = append(os.Environ(), "TALOSCONFIG=/dev/null")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
