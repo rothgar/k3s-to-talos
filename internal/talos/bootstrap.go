@@ -652,15 +652,23 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 }
 
 // cleanupStaleNodes deletes Kubernetes node objects that are NotReady or
-// Unknown.  This is needed after restoring a k3s etcd snapshot: the snapshot
-// contains node registrations from the old k3s cluster.  When Talos boots its
-// kubelet it may register under a different name (or the same name but with a
-// fresh identity), leaving the old entry as NotReady/Unknown.  The mismatch
-// causes `talosctl health` to report "unexpected nodes with IPs [...]".
+// Unknown, and force-deletes any pods still bound to those stale nodes.
+//
+// This is needed after restoring a k3s etcd snapshot: the snapshot contains
+// node registrations from the old k3s cluster.  When Talos boots its kubelet
+// it may register under a different name (or the same name but with a fresh
+// identity), leaving the old entry as NotReady/Unknown.  DaemonSets then
+// schedule a pod for every registered node, so pods end up Pending or stuck
+// Terminating on the phantom node.  The mismatch also causes `talosctl
+// health` to report "unexpected nodes with IPs [...]".
 //
 // The function waits up to 3 minutes for the kube-apiserver to accept kubectl
-// requests, then deletes any NotReady/Unknown nodes.  Non-fatal: failures are
-// logged as warnings so the migration is not aborted.
+// requests, then:
+//  1. Identifies stale (NotReady/Unknown) node objects.
+//  2. Force-deletes all pods assigned to each stale node.
+//  3. Deletes the stale node object itself.
+//
+// Non-fatal: failures are logged as warnings so the migration is not aborted.
 func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 	kubectlPath, err := exec.LookPath("kubectl")
 	if err != nil {
@@ -670,30 +678,31 @@ func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 
 	fmt.Println("  Waiting for Kubernetes API to accept kubectl requests (stale node cleanup)...")
 	deadline := time.Now().Add(3 * time.Minute)
-	var lastOut []byte
+	var nodeOut []byte
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		cmd := exec.CommandContext(ctx, kubectlPath,
 			"--kubeconfig", kubeconfigPath,
 			"get", "nodes", "--no-headers",
-			"-o", "custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1:].type,READY:.status.conditions[-1:].status",
+			"-o", "custom-columns=NAME:.metadata.name,TYPE:.status.conditions[-1:].type,READY:.status.conditions[-1:].status",
 		)
 		out, err := cmd.Output()
 		cancel()
 		if err == nil {
-			lastOut = out
+			nodeOut = out
 			break
 		}
 		time.Sleep(10 * time.Second)
 	}
 
-	if lastOut == nil {
+	if nodeOut == nil {
 		color.Yellow("  Warning: Kubernetes API not ready for stale node cleanup — skipping\n")
 		return
 	}
 
-	deleted := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(lastOut)), "\n") {
+	// Collect stale node names.
+	var staleNodes []string
+	for _, line := range strings.Split(strings.TrimSpace(string(nodeOut)), "\n") {
 		if line == "" {
 			continue
 		}
@@ -706,9 +715,22 @@ func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 		// Stale k3s nodes will have Ready=Unknown or no conditions at all.
 		isStale := (condType == "Ready" && condStatus != "True") ||
 			condType == "<none>" || condStatus == "Unknown"
-		if !isStale {
-			continue
+		if isStale {
+			staleNodes = append(staleNodes, nodeName)
 		}
+	}
+
+	if len(staleNodes) == 0 {
+		fmt.Println("  No stale k3s node objects found.")
+		return
+	}
+
+	for _, nodeName := range staleNodes {
+		// Step 1: force-delete all pods assigned to this stale node so they
+		// don't stay Terminating/Pending forever after the node is removed.
+		b.forceDeletePodsOnNode(kubectlPath, kubeconfigPath, nodeName)
+
+		// Step 2: delete the stale node object itself.
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		delCmd := exec.CommandContext(ctx, kubectlPath,
 			"--kubeconfig", kubeconfigPath,
@@ -721,12 +743,49 @@ func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 				nodeName, delErr, strings.TrimSpace(string(delOut)))
 		} else {
 			color.Green("  ✓ Deleted stale k3s node object: %s\n", nodeName)
-			deleted++
 		}
 	}
+}
 
-	if deleted == 0 {
-		fmt.Println("  No stale k3s node objects found.")
+// forceDeletePodsOnNode force-deletes all pods whose spec.nodeName matches
+// nodeName.  This clears pods that are stuck Terminating or Pending because
+// the node they were scheduled on no longer has a running kubelet.
+func (b *Bootstrapper) forceDeletePodsOnNode(kubectlPath, kubeconfigPath, nodeName string) {
+	// List all pods across all namespaces assigned to this node.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	listCmd := exec.CommandContext(ctx, kubectlPath,
+		"--kubeconfig", kubeconfigPath,
+		"get", "pods", "--all-namespaces", "--no-headers",
+		"--field-selector", "spec.nodeName="+nodeName,
+		"-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name",
+	)
+	out, err := listCmd.Output()
+	cancel()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return // no pods on this node (or API error — skip silently)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		ns, podName := fields[0], fields[1]
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+		delCmd := exec.CommandContext(ctx2, kubectlPath,
+			"--kubeconfig", kubeconfigPath,
+			"-n", ns,
+			"delete", "pod", podName,
+			"--grace-period=0", "--force", "--ignore-not-found",
+		)
+		delOut, delErr := delCmd.CombinedOutput()
+		cancel2()
+		if delErr != nil {
+			color.Yellow("  Warning: could not force-delete pod %s/%s: %v (%s)\n",
+				ns, podName, delErr, strings.TrimSpace(string(delOut)))
+		} else {
+			fmt.Printf("  Force-deleted stuck pod %s/%s (was on stale node %s)\n", ns, podName, nodeName)
+		}
 	}
 }
 
