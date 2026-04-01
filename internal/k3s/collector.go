@@ -147,33 +147,36 @@ func (c *Collector) verifyServer() error {
 }
 
 func (c *Collector) verifyK3sServer() error {
-	active, _ := c.ssh.Run(
+	active, _ := c.ssh.RunNoSudo(
 		`systemctl is-active k3s 2>/dev/null || ` +
 			`systemctl is-active k3s-server 2>/dev/null || ` +
+			`(pgrep -x k3s >/dev/null 2>&1 && echo active) || ` +
 			`(pgrep -f 'k3s server' >/dev/null 2>&1 && echo active) || ` +
 			`echo inactive`)
 	if strings.TrimSpace(active) == "inactive" {
 		return fmt.Errorf("k3s server does not appear to be running on the target machine\n" +
 			"Ensure the k3s server process is active before migrating.")
 	}
-	if !c.ssh.FileExists("/etc/rancher/k3s/k3s.yaml") && !c.ssh.FileExists("/var/lib/rancher/k3s/server") {
-		return fmt.Errorf("target machine does not appear to be a k3s server node (missing /etc/rancher/k3s/k3s.yaml)")
+	// /etc/rancher/k3s/ is mode 755; directory check works without root.
+	if _, err := c.ssh.RunNoSudo("test -d /etc/rancher/k3s"); err != nil {
+		return fmt.Errorf("target machine does not appear to be a k3s server node (missing /etc/rancher/k3s/)")
 	}
 	return nil
 }
 
 func (c *Collector) verifyKubeadmControlPlane() error {
-	active, _ := c.ssh.Run(
+	active, _ := c.ssh.RunNoSudo(
 		`systemctl is-active kubelet 2>/dev/null || ` +
-			`(pgrep -f kubelet >/dev/null 2>&1 && echo active) || ` +
+			`(pgrep -x kubelet >/dev/null 2>&1 && echo active) || ` +
 			`echo inactive`)
 	if strings.TrimSpace(active) == "inactive" {
 		return fmt.Errorf("kubelet does not appear to be running on the target machine\n" +
 			"Ensure kubelet is active before migrating.")
 	}
-	if !c.ssh.FileExists("/etc/kubernetes/admin.conf") {
+	// /etc/kubernetes/ is mode 755; directory check works without root.
+	if _, err := c.ssh.RunNoSudo("test -d /etc/kubernetes"); err != nil {
 		return fmt.Errorf("target machine does not appear to be a kubeadm control-plane node\n" +
-			"(missing /etc/kubernetes/admin.conf — is this a worker node only?)")
+			"(missing /etc/kubernetes/ — is this a worker node only?)")
 	}
 	return nil
 }
