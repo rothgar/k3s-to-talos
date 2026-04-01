@@ -16,9 +16,10 @@ type MigrationState struct {
 	TalosVersion   string          `json:"talos_version"`
 	TalosConfigDir string          `json:"talos_config_dir"`
 	KubeconfigPath string          `json:"kubeconfig_path"`
-	ClusterInfo    *k3s.ClusterInfo `json:"cluster_info,omitempty"`
-	Phases         map[string]bool `json:"phases"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	ClusterInfo     *k3s.ClusterInfo `json:"cluster_info,omitempty"`
+	UsedEtcdRestore bool             `json:"used_etcd_restore,omitempty"` // true when bootstrap used an etcd snapshot
+	Phases          map[string]bool  `json:"phases"`
+	UpdatedAt       time.Time        `json:"updated_at"`
 }
 
 func loadOrInitState(path, host string) (*MigrationState, error) {

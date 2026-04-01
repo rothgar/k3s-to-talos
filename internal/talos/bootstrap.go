@@ -681,10 +681,12 @@ func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 	var nodeOut []byte
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Plain --no-headers output: NAME STATUS ROLES AGE VERSION
+		// STATUS is "Ready" or "NotReady" — derived by kubectl from conditions,
+		// more reliable than querying conditions[-1:] which depends on ordering.
 		cmd := exec.CommandContext(ctx, kubectlPath,
 			"--kubeconfig", kubeconfigPath,
 			"get", "nodes", "--no-headers",
-			"-o", "custom-columns=NAME:.metadata.name,TYPE:.status.conditions[-1:].type,READY:.status.conditions[-1:].status",
 		)
 		out, err := cmd.Output()
 		cancel()
@@ -701,21 +703,19 @@ func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
 	}
 
 	// Collect stale node names.
+	// kubectl --no-headers columns: NAME STATUS ROLES AGE VERSION
+	// STATUS is "Ready" or "NotReady".
 	var staleNodes []string
 	for _, line := range strings.Split(strings.TrimSpace(string(nodeOut)), "\n") {
 		if line == "" {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 3 {
+		if len(fields) < 2 {
 			continue
 		}
-		nodeName, condType, condStatus := fields[0], fields[1], fields[2]
-		// A healthy node has condition type=Ready, status=True.
-		// Stale k3s nodes will have Ready=Unknown or no conditions at all.
-		isStale := (condType == "Ready" && condStatus != "True") ||
-			condType == "<none>" || condStatus == "Unknown"
-		if isStale {
+		nodeName, status := fields[0], fields[1]
+		if status == "NotReady" {
 			staleNodes = append(staleNodes, nodeName)
 		}
 	}

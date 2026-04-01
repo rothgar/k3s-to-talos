@@ -287,16 +287,19 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		}
 
 		state.KubeconfigPath = kubeconfigOut
+		state.UsedEtcdRestore = snapshotPath != ""
 		state.MarkPhaseComplete("BOOTSTRAP")
 		if err := state.Save(stateFile); err != nil {
 			return fmt.Errorf("saving state: %w", err)
 		}
 
-		// Apply backed-up Kubernetes resources to the new cluster.
-		// This is the primary restore path when etcd recovery failed or was
-		// skipped; it also acts as a safety net after a successful etcd restore
-		// (idempotent — objects that already exist are left unchanged).
-		applyResourcesFromBackup(filepath.Join(flagBackupDir, "resources"), kubeconfigOut)
+		// Apply backed-up Kubernetes resources to the new cluster only when we
+		// did NOT restore from an etcd snapshot.  When etcd was restored, all
+		// Kubernetes resources (deployments, services, etc.) already exist in
+		// etcd — re-applying them is unnecessary and can cause conflicts.
+		if snapshotPath == "" {
+			applyResourcesFromBackup(filepath.Join(flagBackupDir, "resources"), kubeconfigOut)
+		}
 	} else {
 		ui.PrintPhaseSkipped(5, "BOOTSTRAP", "already completed")
 	}
@@ -371,13 +374,20 @@ func printMigrationSuccess(state *MigrationState) {
 	fmt.Printf("  1. Access the cluster:\n")
 	fmt.Printf("       export KUBECONFIG=%s\n", state.KubeconfigPath)
 	fmt.Printf("       kubectl get nodes\n\n")
-	fmt.Printf("  2. Restore workloads from backup:\n")
-	fmt.Printf("       kubectl apply -f %s/resources/\n\n", state.BackupDir)
-	fmt.Printf("  3. Check persistent volume data — PV data was NOT migrated\n")
+
+	step := 2
+	if !state.UsedEtcdRestore {
+		fmt.Printf("  %d. Restore workloads from backup:\n", step)
+		fmt.Printf("       kubectl apply -f %s/resources/ --recursive\n\n", state.BackupDir)
+		step++
+	}
+
+	fmt.Printf("  %d. Check persistent volume data — PV data was NOT migrated\n", step)
 	fmt.Printf("     automatically. Refer to your backup strategy.\n\n")
+	step++
 
 	if len(state.ClusterInfo.Nodes) > 1 {
-		color.Yellow("  4. This was a multi-node cluster. Migrate each remaining node:\n")
+		color.Yellow("  %d. This was a multi-node cluster. Migrate each remaining node:\n", step)
 		for _, node := range state.ClusterInfo.Nodes {
 			if node.IsControlPlane {
 				continue
