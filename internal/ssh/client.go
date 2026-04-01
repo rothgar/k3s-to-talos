@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
 
@@ -54,14 +55,14 @@ func NewClient(opts Options) (*Client, error) {
 	cfg := &ssh.ClientConfig{
 		User:            opts.User,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // operator tool; host key pinning is out of scope
+		HostKeyCallback: buildHostKeyCallback(),
 		Timeout:         30 * time.Second,
 	}
 
 	addr := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
 	client, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
+		return nil, formatDialError(opts.Host, addr, err)
 	}
 
 	return &Client{opts: opts, client: client}, nil
@@ -271,6 +272,55 @@ func (c *Client) sftpUploadBytes(content []byte, remotePath string) error {
 		return fmt.Errorf("uploading to %s: %w", remotePath, err)
 	}
 	return nil
+}
+
+// buildHostKeyCallback returns a HostKeyCallback that verifies against
+// ~/.ssh/known_hosts.  Unknown hosts (not yet in the file) are accepted
+// silently so first-time connections work without manual intervention.
+// If the host IS in known_hosts but the key no longer matches, the callback
+// returns an error so the caller can show a clear remediation message.
+// Falls back to InsecureIgnoreHostKey when known_hosts cannot be loaded.
+func buildHostKeyCallback() ssh.HostKeyCallback {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ssh.InsecureIgnoreHostKey() //nolint:gosec
+	}
+	knownHostsPath := filepath.Join(home, ".ssh", "known_hosts")
+	if _, err := os.Stat(knownHostsPath); err != nil {
+		return ssh.InsecureIgnoreHostKey() //nolint:gosec
+	}
+	cb, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		return ssh.InsecureIgnoreHostKey() //nolint:gosec
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := cb(hostname, remote, key)
+		if err == nil {
+			return nil
+		}
+		var keyErr *knownhosts.KeyError
+		if errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
+			// Host not in known_hosts yet — allow the connection.
+			return nil
+		}
+		// Key mismatch for a known host — surface the real error.
+		return err
+	}
+}
+
+// formatDialError wraps ssh.Dial errors with actionable remediation hints.
+func formatDialError(host, addr string, err error) error {
+	var keyErr *knownhosts.KeyError
+	if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
+		return fmt.Errorf(
+			"connecting to %s: host key has changed (known_hosts mismatch).\n"+
+				"If the server was rebuilt, remove the old entry and retry:\n"+
+				"  ssh-keygen -R %s\n"+
+				"Original error: %w",
+			addr, host, err,
+		)
+	}
+	return fmt.Errorf("connecting to %s: %w", addr, err)
 }
 
 // buildAuthMethods constructs SSH auth methods: key-based first, password fallback.
