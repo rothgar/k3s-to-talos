@@ -196,6 +196,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			ClusterName:                   clusterName,
 			ControlPlaneIP:                host,
 			TalosVersion:                  flagTalosVersion,
+			KubernetesVersion:             state.ClusterInfo.K8sVersion,
 			OutputDir:                     talosConfigDir,
 			DryRun:                        flagDryRun,
 			PodCIDR:                       state.ClusterInfo.PodCIDR,

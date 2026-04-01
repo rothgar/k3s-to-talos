@@ -13,11 +13,12 @@ import (
 
 // GenerateOptions holds parameters for talosctl gen config.
 type GenerateOptions struct {
-	ClusterName    string
-	ControlPlaneIP string
-	TalosVersion   string
-	OutputDir      string
-	DryRun         bool
+	ClusterName       string
+	ControlPlaneIP    string
+	TalosVersion      string
+	KubernetesVersion string // passed as --kubernetes-version; empty = talosctl default
+	OutputDir         string
+	DryRun            bool
 	// PodCIDR and ServiceCIDR override the default Talos network ranges so
 	// they match the source cluster.  After etcd restore the old Flannel
 	// network config (stored in etcd by the source cluster) must match what
@@ -125,6 +126,9 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 
 	if opts.TalosVersion != "" {
 		args = append(args, "--talos-version", opts.TalosVersion)
+	}
+	if opts.KubernetesVersion != "" {
+		args = append(args, "--kubernetes-version", opts.KubernetesVersion)
 	}
 
 	if opts.DryRun {

@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	flagControlPlaneEndpoint string
-	flagGenerateClusterName  string
-	flagGenerateTalosVersion string
+	flagControlPlaneEndpoint    string
+	flagGenerateClusterName     string
+	flagGenerateTalosVersion    string
+	flagGenerateKubernetesVersion string
 )
 
 var generateCmd = &cobra.Command{
@@ -33,6 +34,8 @@ func init() {
 		"Name for the Talos cluster")
 	generateCmd.Flags().StringVar(&flagGenerateTalosVersion, "talos-version", "v1.12.6",
 		"Talos Linux version to target")
+	generateCmd.Flags().StringVar(&flagGenerateKubernetesVersion, "kubernetes-version", "",
+		"Kubernetes version to embed in the config (default: talosctl's bundled version)")
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
@@ -49,11 +52,12 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 	gen := talos.NewConfigGenerator(flagBackupDir)
 	if err := gen.Generate(talos.GenerateOptions{
-		ClusterName:    flagGenerateClusterName,
-		ControlPlaneIP: endpoint,
-		TalosVersion:   flagGenerateTalosVersion,
-		OutputDir:      talosConfigDir,
-		DryRun:         false,
+		ClusterName:       flagGenerateClusterName,
+		ControlPlaneIP:    endpoint,
+		TalosVersion:      flagGenerateTalosVersion,
+		KubernetesVersion: flagGenerateKubernetesVersion,
+		OutputDir:         talosConfigDir,
+		DryRun:            false,
 	}); err != nil {
 		return fmt.Errorf("generating Talos config: %w", err)
 	}

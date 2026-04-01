@@ -182,22 +182,57 @@ func (c *Collector) verifyKubeadmControlPlane() error {
 }
 
 func (c *Collector) collectVersion(info *ClusterInfo) error {
-	var vCmd string
 	if c.clusterType == ClusterTypeKubeadm {
-		vCmd = "kubelet --version 2>/dev/null"
-	} else {
-		vCmd = "k3s --version 2>/dev/null | head -1"
+		v, err := c.ssh.Run("kubelet --version 2>/dev/null")
+		if err != nil {
+			return fmt.Errorf("getting version: %w", err)
+		}
+		info.K3sVersion = strings.TrimSpace(v)
+		// "Kubernetes v1.34.6"
+		info.K8sVersion = extractSemver(info.K3sVersion)
+		return nil
 	}
 
-	v, err := c.ssh.Run(vCmd)
+	// k3s --version emits two lines:
+	//   k3s version v1.34.6+k3s1 (abc123)
+	//   kubernetes v1.34.6
+	// Use the "kubernetes" line for the clean k8s version.  This avoids
+	// kubectl version --short which was removed in k8s 1.28.
+	v, err := c.ssh.Run("k3s --version 2>/dev/null")
 	if err != nil {
 		return fmt.Errorf("getting version: %w", err)
 	}
 	info.K3sVersion = strings.TrimSpace(v)
-
-	kv, _ := c.ssh.Run(c.kubectlBin() + " version --short 2>/dev/null | grep 'Server Version' | awk '{print $3}'")
-	info.K8sVersion = strings.TrimSpace(kv)
+	for _, line := range strings.Split(v, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "kubernetes ") {
+			info.K8sVersion = strings.TrimPrefix(line, "kubernetes ")
+			break
+		}
+	}
+	// Fallback: strip the +k3s1 suffix from the first version token.
+	if info.K8sVersion == "" {
+		info.K8sVersion = extractSemver(v)
+	}
 	return nil
+}
+
+// extractSemver finds the first "vX.Y.Z" token in s, stripping any
+// distribution suffix after "+" (e.g. "+k3s1", "+k3s2").
+func extractSemver(s string) string {
+	for _, f := range strings.Fields(s) {
+		if !strings.HasPrefix(f, "v") {
+			continue
+		}
+		if idx := strings.Index(f, "+"); idx >= 0 {
+			f = f[:idx]
+		}
+		parts := strings.SplitN(strings.TrimPrefix(f, "v"), ".", 3)
+		if len(parts) == 3 {
+			return f
+		}
+	}
+	return ""
 }
 
 func (c *Collector) collectNodes(info *ClusterInfo) error {
