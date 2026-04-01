@@ -30,8 +30,9 @@ type Options struct {
 // Client wraps an SSH connection and provides helpers for remote execution
 // and file transfer.
 type Client struct {
-	opts   Options
-	client *ssh.Client
+	opts         Options
+	client       *ssh.Client
+	sudoPassword string // cached password for sudo -S; empty when NOPASSWD is configured
 }
 
 // NewClient establishes an SSH connection using key-based auth, falling back
@@ -61,12 +62,26 @@ func NewClient(opts Options) (*Client, error) {
 	}
 
 	addr := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
-	client, err := ssh.Dial("tcp", addr, cfg)
+	sshClient, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
 		return nil, formatDialError(opts.Host, addr, err)
 	}
 
-	return &Client{opts: opts, client: client}, nil
+	c := &Client{opts: opts, client: sshClient}
+
+	// For non-root users, check whether sudo needs a password and prompt once.
+	if opts.Sudo {
+		if needsPw, err := c.sudoNeedsPassword(); err == nil && needsPw {
+			pw, err := promptSudoPassword(opts.User, opts.Host)
+			if err != nil {
+				sshClient.Close()
+				return nil, err
+			}
+			c.sudoPassword = pw
+		}
+	}
+
+	return c, nil
 }
 
 // Close closes the underlying SSH connection.
@@ -76,12 +91,17 @@ func (c *Client) Close() {
 	}
 }
 
-// sudoWrap prepends "sudo " to a command when the Sudo option is set.
+// sudoWrap prepends sudo to a command when the Sudo option is set.
+// Uses "sudo -S -p ''" when a cached password is available so the password
+// can be supplied via stdin without any prompt text contaminating the output.
 func (c *Client) sudoWrap(cmd string) string {
-	if c.opts.Sudo {
-		return "sudo " + cmd
+	if !c.opts.Sudo {
+		return cmd
 	}
-	return cmd
+	if c.sudoPassword != "" {
+		return "sudo -S -p '' " + cmd
+	}
+	return "sudo " + cmd
 }
 
 // Run executes a command on the remote machine and returns its combined output.
@@ -92,6 +112,9 @@ func (c *Client) Run(cmd string) (string, error) {
 	}
 	defer sess.Close()
 
+	if c.sudoPassword != "" {
+		sess.Stdin = strings.NewReader(c.sudoPassword + "\n")
+	}
 	out, err := sess.CombinedOutput(c.sudoWrap(cmd))
 	if err != nil {
 		return string(out), fmt.Errorf("running %q: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
@@ -125,6 +148,9 @@ func (c *Client) RunStream(cmd string, stdout, stderr io.Writer) error {
 
 	sess.Stdout = stdout
 	sess.Stderr = stderr
+	if c.sudoPassword != "" {
+		sess.Stdin = strings.NewReader(c.sudoPassword + "\n")
+	}
 
 	return sess.Run(c.sudoWrap(cmd))
 }
@@ -289,6 +315,36 @@ func (c *Client) sftpUploadBytes(content []byte, remotePath string) error {
 		return fmt.Errorf("uploading to %s: %w", remotePath, err)
 	}
 	return nil
+}
+
+// sudoNeedsPassword runs "sudo -n true" to check whether passwordless sudo is
+// configured.  Returns (true, nil) when a password is required.
+func (c *Client) sudoNeedsPassword() (bool, error) {
+	sess, err := c.client.NewSession()
+	if err != nil {
+		return false, err
+	}
+	defer sess.Close()
+	out, err := sess.CombinedOutput("sudo -n true 2>&1")
+	if err == nil {
+		return false, nil // NOPASSWD — no password needed
+	}
+	msg := strings.ToLower(string(out))
+	if strings.Contains(msg, "password") || strings.Contains(msg, "askpass") {
+		return true, nil
+	}
+	return false, fmt.Errorf("sudo check failed: %s", strings.TrimSpace(string(out)))
+}
+
+// promptSudoPassword asks the user to enter their sudo password interactively.
+func promptSudoPassword(user, host string) (string, error) {
+	fmt.Printf("[sudo] password for %s@%s: ", user, host)
+	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return "", fmt.Errorf("reading sudo password: %w", err)
+	}
+	return string(pw), nil
 }
 
 // buildHostKeyCallback returns a HostKeyCallback that verifies against
