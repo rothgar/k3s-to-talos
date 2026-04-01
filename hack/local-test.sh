@@ -84,8 +84,8 @@ Options:
   --talos-version V   Talos version (default: ${TALOS_VERSION})
   --keep-vms          Don't destroy VMs after test (for debugging)
   --clean             Remove cache and temp dirs, then exit
-  --binary PATH       k3s-to-talos binary path (default: build with 'go build')
-  --no-build          Skip building binary (use existing ./k3s-to-talos)
+  --binary PATH       k2t binary path (default: build with 'go build')
+  --no-build          Skip building binary (use existing ./k2t)
   --setup             Print prerequisite install instructions, then exit
   -h, --help          Show this help
 EOF
@@ -481,14 +481,14 @@ build_binary() {
     return
   fi
   if $NO_BUILD; then
-    BINARY="${REPO_ROOT}/k3s-to-talos"
+    BINARY="${REPO_ROOT}/k2t"
     [[ -x "${BINARY}" ]] || die "--no-build set but ${BINARY} not found or not executable."
     log_ok "Using existing binary: ${BINARY}"
     return
   fi
-  log_info "Building k3s-to-talos…"
-  (cd "${REPO_ROOT}" && go build -o k3s-to-talos .)
-  BINARY="${REPO_ROOT}/k3s-to-talos"
+  log_info "Building k2t…"
+  (cd "${REPO_ROOT}" && go build -o k2t .)
+  BINARY="${REPO_ROOT}/k2t"
   log_ok "Binary built: ${BINARY}"
 }
 
@@ -497,7 +497,7 @@ build_binary() {
 # ---------------------------------------------------------------------------
 run_migrate() {
   local host="$1" ssh_port="$2"
-  log_info "Running k3s-to-talos migrate on ${host}:${ssh_port}…"
+  log_info "Running k2t migrate on ${host}:${ssh_port}…"
   "${BINARY}" migrate \
     --host "${host}" \
     --ssh-port "${ssh_port}" \
@@ -516,7 +516,7 @@ run_migrate() {
 # ---------------------------------------------------------------------------
 run_join_worker() {
   local host="$1"
-  log_info "Running k3s-to-talos join-worker on ${host}…"
+  log_info "Running k2t join-worker on ${host}…"
   "${BINARY}" join-worker \
     --host "${host}" \
     --ssh-user ubuntu \

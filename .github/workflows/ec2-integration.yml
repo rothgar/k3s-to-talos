@@ -28,11 +28,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o k3s-to-talos .
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o k2t .
       - uses: actions/upload-artifact@v4
         with:
-          name: k3s-to-talos-binary
-          path: k3s-to-talos
+          name: k2t-binary
+          path: k2t
           retention-days: 1
 
   # ── Resolve Ubuntu AMI ID ──────────────────────────────────────────────────────
@@ -73,8 +73,8 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: k3s-to-talos-binary
-      - run: chmod +x k3s-to-talos
+          name: k2t-binary
+      - run: chmod +x k2t
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -201,13 +201,13 @@ jobs:
       #   3. Runs nextboot-talos.py — rewrites disk with Talos image, reboots
       #   4. Waits for Talos, applies config, restores etcd from snapshot,
       #      retrieves kubeconfig
-      - name: Run k3s-to-talos migrate
+      - name: Run k2t migrate
         run: |
           mkdir -p test-backup
           # Tee all output to a log file so the backup artifact captures it.
           # pipefail ensures the exit code comes from migrate, not tee.
           set -o pipefail
-          ./k3s-to-talos migrate \
+          ./k2t migrate \
             --host "ubuntu@$NODE_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
@@ -386,8 +386,8 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: k3s-to-talos-binary
-      - run: chmod +x k3s-to-talos
+          name: k2t-binary
+      - run: chmod +x k2t
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -579,11 +579,11 @@ jobs:
           $SSH "sudo k3s kubectl get deployment ci-test-nginx"
 
       # ── Migrate control plane ─────────────────────────────────────────────
-      - name: Run k3s-to-talos migrate (control plane)
+      - name: Run k2t migrate (control plane)
         run: |
           mkdir -p test-backup
           set -o pipefail
-          ./k3s-to-talos migrate \
+          ./k2t migrate \
             --host "ubuntu@$CP_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
@@ -771,7 +771,7 @@ jobs:
       - name: Run join-worker (worker node)
         run: |
           set -o pipefail
-          ./k3s-to-talos join-worker \
+          ./k2t join-worker \
             --host "ubuntu@$WORKER_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
@@ -918,8 +918,8 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: k3s-to-talos-binary
-      - run: chmod +x k3s-to-talos
+          name: k2t-binary
+      - run: chmod +x k2t
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -1034,11 +1034,11 @@ jobs:
           $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf \
             get deployment ci-test-nginx"
 
-      - name: Run k3s-to-talos migrate (kubeadm)
+      - name: Run k2t migrate (kubeadm)
         run: |
           mkdir -p test-backup
           set -o pipefail
-          ./k3s-to-talos migrate \
+          ./k2t migrate \
             --host "ubuntu@$NODE_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
@@ -1168,8 +1168,8 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          name: k3s-to-talos-binary
-      - run: chmod +x k3s-to-talos
+          name: k2t-binary
+      - run: chmod +x k2t
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -1374,11 +1374,11 @@ jobs:
             -p '{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"'\"$WORKER_NODE\"'\"}}}}'" || true
           $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get deployment ci-test-nginx"
 
-      - name: Run k3s-to-talos migrate (control plane)
+      - name: Run k2t migrate (control plane)
         run: |
           mkdir -p test-backup
           set -o pipefail
-          ./k3s-to-talos migrate \
+          ./k2t migrate \
             --host "ubuntu@$CP_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
@@ -1487,7 +1487,7 @@ jobs:
       - name: Run join-worker (worker node)
         run: |
           set -o pipefail
-          ./k3s-to-talos join-worker \
+          ./k2t join-worker \
             --host "ubuntu@$WORKER_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
             --talos-version "${{ env.TALOS_VERSION }}" \
