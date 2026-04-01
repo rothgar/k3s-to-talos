@@ -25,6 +25,7 @@ type Options struct {
 	User    string
 	KeyPath string
 	Sudo    bool // prefix privileged commands with sudo; auto-set when User != "root"
+	Verbose bool // print each command and its output to stderr
 }
 
 // Client wraps an SSH connection and provides helpers for remote execution
@@ -91,6 +92,29 @@ func (c *Client) Close() {
 	}
 }
 
+// logCmd prints the command being executed when verbose mode is enabled.
+// The prompt character mirrors shell convention: '#' for root, '$' otherwise.
+func (c *Client) logCmd(raw, wrapped string) {
+	if !c.opts.Verbose {
+		return
+	}
+	prompt := "$"
+	if c.opts.Sudo || c.opts.User == "root" {
+		prompt = "#"
+	}
+	fmt.Fprintf(os.Stderr, "\n[ssh %s@%s] %s %s\n", c.opts.User, c.opts.Host, prompt, raw)
+}
+
+// logOutput prints command output when verbose mode is enabled.
+func (c *Client) logOutput(out string) {
+	if !c.opts.Verbose || strings.TrimSpace(out) == "" {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		fmt.Fprintf(os.Stderr, "    %s\n", line)
+	}
+}
+
 // sudoWrap prepends sudo to a command when the Sudo option is set.
 // Uses "sudo -S -p ''" when a cached password is available so the password
 // can be supplied via stdin without any prompt text contaminating the output.
@@ -112,10 +136,13 @@ func (c *Client) Run(cmd string) (string, error) {
 	}
 	defer sess.Close()
 
+	wrapped := c.sudoWrap(cmd)
+	c.logCmd(cmd, wrapped)
 	if c.sudoPassword != "" {
 		sess.Stdin = strings.NewReader(c.sudoPassword + "\n")
 	}
-	out, err := sess.CombinedOutput(c.sudoWrap(cmd))
+	out, err := sess.CombinedOutput(wrapped)
+	c.logOutput(string(out))
 	if err != nil {
 		return string(out), fmt.Errorf("running %q: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
 	}
@@ -131,7 +158,9 @@ func (c *Client) RunNoSudo(cmd string) (string, error) {
 	}
 	defer sess.Close()
 
+	c.logCmd(cmd, cmd)
 	out, err := sess.CombinedOutput(cmd)
+	c.logOutput(string(out))
 	if err != nil {
 		return string(out), fmt.Errorf("running %q: %w (output: %s)", cmd, err, strings.TrimSpace(string(out)))
 	}
@@ -146,13 +175,15 @@ func (c *Client) RunStream(cmd string, stdout, stderr io.Writer) error {
 	}
 	defer sess.Close()
 
+	wrapped := c.sudoWrap(cmd)
+	c.logCmd(cmd, wrapped)
 	sess.Stdout = stdout
 	sess.Stderr = stderr
 	if c.sudoPassword != "" {
 		sess.Stdin = strings.NewReader(c.sudoPassword + "\n")
 	}
 
-	return sess.Run(c.sudoWrap(cmd))
+	return sess.Run(wrapped)
 }
 
 // RunIgnoreError executes a command and returns output, suppressing non-zero exit codes.

@@ -108,6 +108,7 @@ func runJoinWorker(cmd *cobra.Command, args []string) error {
 		Host:            host,
 		TalosConfigFile: filepath.Clean(flagTalosConfig),
 		WorkerCfgFile:   filepath.Clean(flagWorkerConfig),
+		Verbose:         flagVerbose,
 	}); err != nil {
 		return fmt.Errorf("bootstrapping worker: %w", err)
 	}

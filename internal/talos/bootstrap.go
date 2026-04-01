@@ -21,11 +21,13 @@ type BootstrapOptions struct {
 	ControlPlaneCfg  string
 	KubeconfigOut    string
 	EtcdSnapshotPath string // if set, run etcd recover instead of bootstrap
+	Verbose          bool   // print each talosctl invocation to stderr
 }
 
 // Bootstrapper handles waiting for Talos to boot and running bootstrap.
 type Bootstrapper struct {
 	backupDir string
+	verbose   bool
 }
 
 // NewBootstrapper creates a new Bootstrapper.
@@ -36,6 +38,7 @@ func NewBootstrapper(backupDir string) *Bootstrapper {
 // Bootstrap waits for Talos to boot, applies config, bootstraps Kubernetes,
 // and retrieves the kubeconfig.
 func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
+	b.verbose = opts.Verbose
 	talosctlPath, err := exec.LookPath("talosctl")
 	if err != nil {
 		return fmt.Errorf("talosctl not found in PATH")
@@ -171,6 +174,7 @@ type WorkerBootstrapOptions struct {
 	Host            string
 	TalosConfigFile string // talosconfig from the CP migration
 	WorkerCfgFile   string // worker.yaml from the CP migration
+	Verbose         bool
 }
 
 // BootstrapWorker installs Talos on a worker node and waits for it to join the
@@ -182,6 +186,7 @@ type WorkerBootstrapOptions struct {
 // injects machine.certSANs=[host] via the apply-config --patch flag so that
 // CA-verified talosctl calls via the public IP succeed after the first reboot.
 func (b *Bootstrapper) BootstrapWorker(opts WorkerBootstrapOptions) error {
+	b.verbose = opts.Verbose
 	talosctlPath, err := exec.LookPath("talosctl")
 	if err != nil {
 		return fmt.Errorf("talosctl not found in PATH")
@@ -730,6 +735,9 @@ func (b *Bootstrapper) runTalosctlCtx(ctx context.Context, binary, talosconfig s
 // runTalosctlWithOutput runs talosctl and returns (stdout+stderr, error).
 func (b *Bootstrapper) runTalosctlWithOutput(binary, talosconfig string, args ...string) (string, error) {
 	allArgs := append([]string{"--talosconfig", talosconfig}, args...)
+	if b.verbose {
+		fmt.Fprintf(os.Stderr, "\n[talosctl] $ %s %s\n", binary, strings.Join(allArgs, " "))
+	}
 	cmd := exec.Command(binary, allArgs...)
 
 	var stdout, stderr bytes.Buffer
@@ -773,6 +781,9 @@ func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...stri
 		allArgs = append(append([]string{args[0], "--insecure"}, args[1:]...))
 	} else {
 		allArgs = []string{"--insecure"}
+	}
+	if b.verbose {
+		fmt.Fprintf(os.Stderr, "\n[talosctl] $ TALOSCONFIG=/dev/null %s %s\n", binary, strings.Join(allArgs, " "))
 	}
 	cmd := exec.Command(binary, allArgs...)
 	cmd.Env = append(os.Environ(), "TALOSCONFIG=/dev/null")

@@ -17,6 +17,7 @@ var (
 	flagSSHKey    string
 	flagSSHPort   int
 	flagBackupDir string
+	flagVerbose   bool
 )
 
 var rootCmd = &cobra.Command{
@@ -118,6 +119,7 @@ func sshOpts(target string) ssh.Options {
 		Port:    port,
 		User:    user,
 		KeyPath: keyPath,
+		Verbose: flagVerbose,
 	}
 }
 
@@ -168,6 +170,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagSSHKey, "ssh-key", "", "Path to SSH private key (overrides ~/.ssh/config IdentityFile)")
 	rootCmd.PersistentFlags().IntVar(&flagSSHPort, "ssh-port", 0, "SSH port (overrides ~/.ssh/config Port; default 22)")
 	rootCmd.PersistentFlags().StringVar(&flagBackupDir, "backup-dir", "./k3s-backup", "Local directory for backups and generated configs")
+	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Print each remote command and its output as it runs")
 
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(joinWorkerCmd)
