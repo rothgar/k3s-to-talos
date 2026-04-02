@@ -383,7 +383,8 @@ create_overlay_disk() {
   local name="$1"
   local base_img="$2"
   local overlay="${WORK_DIR}/${name}-disk.qcow2"
-  qemu-img create -f qcow2 -b "${base_img}" -F qcow2 "${overlay}" 20G
+  qemu-img create -f qcow2 -b "${base_img}" -F qcow2 "${overlay}" 20G >&2 \
+    || die "qemu-img create failed for ${overlay}"
   echo "${overlay}"
 }
 
@@ -438,8 +439,7 @@ wait_for_kubectl() {
     fi
     sleep 5
   done
-  log_err "Timed out waiting for: ${label}"
-  return 1
+  die "Timed out waiting for: ${label}"
 }
 
 # ---------------------------------------------------------------------------
@@ -506,7 +506,7 @@ run_migrate() {
     --cluster-name local-test \
     --yes \
     --backup-dir "${WORK_DIR}/backup" \
-    2>&1 | tee "${WORK_DIR}/migrate.log"
+    2>&1 | tee "${WORK_DIR}/migrate.log" || die "k2t migrate failed (see ${WORK_DIR}/migrate.log)"
 }
 
 # ---------------------------------------------------------------------------
@@ -522,7 +522,7 @@ run_join_worker() {
     --worker-config "${WORK_DIR}/backup/talos-config/worker.yaml" \
     --talosconfig "${WORK_DIR}/backup/talos-config/talosconfig" \
     --backup-dir "${WORK_DIR}/backup" \
-    2>&1 | tee "${WORK_DIR}/join-worker.log"
+    2>&1 | tee "${WORK_DIR}/join-worker.log" || die "k2t join-worker failed (see ${WORK_DIR}/join-worker.log)"
 }
 
 # ---------------------------------------------------------------------------
