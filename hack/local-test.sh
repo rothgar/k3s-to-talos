@@ -293,18 +293,24 @@ EOF
   sed "s|__SSH_PUBLIC_KEY__|${pubkey}|g" "${userdata_src}" > "${ci_dir}/user-data"
 
   # network-config (cloud-init v2)
+  # Use match: name: "en*" to match any ethernet interface regardless of
+  # naming scheme (enp0s2 on q35, enp1s0 on i440fx, ens3 on some clouds).
   if [[ "$ip" == "dhcp" ]]; then
     cat > "${ci_dir}/network-config" <<EOF
 version: 2
 ethernets:
-  enp1s0:
+  id0:
+    match:
+      name: "en*"
     dhcp4: true
 EOF
   else
     cat > "${ci_dir}/network-config" <<EOF
 version: 2
 ethernets:
-  enp1s0:
+  id0:
+    match:
+      name: "en*"
     addresses: [${ip}/24]
     gateway4: ${GATEWAY}
     nameservers:
