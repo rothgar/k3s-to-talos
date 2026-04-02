@@ -355,7 +355,7 @@ vm_start() {
     -machine q35 \
     -cpu host \
     -smp 2 \
-    -m 2048 \
+    -m 4096 \
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
     -drive if=pflash,format=raw,file="${WORK_DIR}/${name}-vars.fd" \
     -drive file="${disk}",if=virtio,format=qcow2 \
@@ -515,6 +515,7 @@ run_migrate() {
     --talos-version "${TALOS_VERSION}" \
     --cluster-name local-test \
     --yes \
+    --verbose \
     --backup-dir "${WORK_DIR}/backup" \
     2>&1 | tee "${WORK_DIR}/migrate.log" || die "k2t migrate failed (see ${WORK_DIR}/migrate.log)"
 }

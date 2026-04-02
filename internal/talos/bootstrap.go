@@ -86,16 +86,27 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		inMaintenanceMode := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
 		if inMaintenanceMode {
 			fmt.Println("  Talos is in maintenance mode — applying control plane configuration...")
-			// Use runTalosctlInsecure (no --talosconfig, no client cert) for
-			// maintenance-mode apply-config.  Maintenance mode does not require
-			// mTLS; passing a client cert from talosconfig can confuse newer
-			// Talos builds that check the cert against a non-existent CA.
-			if applyErr := b.runTalosctlInsecure(talosctlPath,
+			// Try apply-config without talosconfig first (pure insecure), then
+			// with talosconfig+insecure as a fallback.  Different Talos versions
+			// may require one or the other approach in maintenance mode.
+			applyErr := b.runTalosctlInsecure(talosctlPath,
 				"apply-config",
 				"--nodes", opts.Host,
 				"--endpoints", opts.Host,
 				"--file", opts.ControlPlaneCfg,
-			); applyErr != nil {
+			)
+			if applyErr != nil {
+				color.Yellow("  apply-config (insecure, no talosconfig) failed: %v\n", summariseError(applyErr))
+				fmt.Println("  Retrying with talosconfig + --insecure...")
+				_, applyErr = b.runTalosctlWithOutput(talosctlPath, opts.TalosConfigFile,
+					"apply-config",
+					"--insecure",
+					"--nodes", opts.Host,
+					"--endpoints", opts.Host,
+					"--file", opts.ControlPlaneCfg,
+				)
+			}
+			if applyErr != nil {
 				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
 				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
 			} else {
