@@ -87,6 +87,18 @@ func (b *Backup) Run(info *ClusterInfo, dryRun bool) error {
 		fmt.Printf("  [DRY RUN] Would export Kubernetes resources to %s/resources/\n", b.backupDir)
 	}
 
+	// 4. Back up local-path-provisioner PV data
+	if info.LocalPath.Detected && len(info.PVs) > 0 {
+		if !dryRun {
+			if err := b.backupPVData(info); err != nil {
+				fmt.Printf("  Warning: PV data backup failed: %v\n", err)
+				fmt.Printf("  PV data will need to be restored manually after migration.\n")
+			}
+		} else {
+			fmt.Printf("  [DRY RUN] Would back up local-path-provisioner data from %s\n", info.LocalPath.HostPath)
+		}
+	}
+
 	return nil
 }
 
@@ -419,6 +431,92 @@ func (b *Backup) exportResources(kubeconfigPath string, info *ClusterInfo) error
 		for _, e := range exportErrors {
 			fmt.Printf("    - %s\n", e)
 		}
+	}
+
+	return nil
+}
+
+// backupPVData tars local-path-provisioner PV data from the remote node.
+// Each PV directory is downloaded as a separate tar archive so they can be
+// restored individually.
+func (b *Backup) backupPVData(info *ClusterInfo) error {
+	pvDataDir := filepath.Join(b.backupDir, "pv-data")
+	if err := os.MkdirAll(pvDataDir, 0750); err != nil {
+		return fmt.Errorf("creating pv-data dir: %w", err)
+	}
+
+	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+	s.Suffix = " Backing up PersistentVolume data..."
+	s.Start()
+	defer s.Stop()
+
+	// Verify the local-path directory exists on the remote node.
+	hostPath := info.LocalPath.HostPath
+	if _, err := b.ssh.Run(fmt.Sprintf("test -d %s", hostPath)); err != nil {
+		s.Stop()
+		fmt.Printf("  Local-path directory %s not found on remote — skipping PV backup\n", hostPath)
+		return nil
+	}
+
+	backed := 0
+	for _, pv := range info.PVs {
+		if pv.StorageClass != "local-path" || pv.HostPath == "" {
+			continue
+		}
+		s.Suffix = fmt.Sprintf(" Backing up PV %s...", pv.Name)
+
+		// Check if the PV directory exists on the remote.
+		if _, err := b.ssh.Run(fmt.Sprintf("test -d %s", pv.HostPath)); err != nil {
+			continue // PV directory doesn't exist, skip
+		}
+
+		tarName := pv.Name + ".tar.gz"
+		remoteTar := fmt.Sprintf("/tmp/%s", tarName)
+		localTar := filepath.Join(pvDataDir, tarName)
+
+		// Create tar on the remote node (preserving the directory basename).
+		dir := filepath.Dir(pv.HostPath)
+		base := filepath.Base(pv.HostPath)
+		if _, err := b.ssh.Run(fmt.Sprintf("tar czf %s -C %s %s", remoteTar, dir, base)); err != nil {
+			fmt.Printf("  Warning: failed to tar PV %s: %v\n", pv.Name, err)
+			continue
+		}
+
+		// Download the tar.
+		if err := b.ssh.Download(remoteTar, localTar); err != nil {
+			fmt.Printf("  Warning: failed to download PV %s: %v\n", pv.Name, err)
+			continue
+		}
+
+		// Clean up remote tar.
+		b.ssh.Run(fmt.Sprintf("rm -f %s", remoteTar)) //nolint:errcheck
+		backed++
+	}
+
+	s.Stop()
+	if backed > 0 {
+		fmt.Printf("  ✓ Backed up %d PV data archives to %s\n", backed, pvDataDir)
+	} else {
+		fmt.Println("  No local-path PV data found to back up")
+	}
+
+	// Save a manifest mapping PV names to their original and target paths.
+	// This is used during restore to recreate the directory structure.
+	manifest := make([]map[string]string, 0, backed)
+	for _, pv := range info.PVs {
+		if pv.StorageClass != "local-path" || pv.HostPath == "" {
+			continue
+		}
+		manifest = append(manifest, map[string]string{
+			"name":       pv.Name,
+			"claim_ref":  pv.ClaimRef,
+			"source_path": pv.HostPath,
+			"target_path": "/var/local-path-provisioner/" + filepath.Base(pv.HostPath),
+		})
+	}
+	if len(manifest) > 0 {
+		data, _ := json.MarshalIndent(manifest, "", "  ")
+		os.WriteFile(filepath.Join(pvDataDir, "pv-manifest.json"), data, 0600) //nolint:errcheck
 	}
 
 	return nil

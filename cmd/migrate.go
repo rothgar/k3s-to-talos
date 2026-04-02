@@ -300,6 +300,16 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		if snapshotPath == "" {
 			applyResourcesFromBackup(filepath.Join(flagBackupDir, "resources"), kubeconfigOut)
 		}
+
+		// Restore local-path-provisioner PV data if we backed it up.
+		if state.ClusterInfo.LocalPath.Detected {
+			fmt.Println()
+			color.Blue("[6/6] Restoring PersistentVolume data\n")
+			if err := talos.RestorePVData(kubeconfigOut, flagBackupDir); err != nil {
+				color.Yellow("  Warning: PV data restore failed: %v\n", err)
+				color.Yellow("  You can restore manually from %s/pv-data/\n", flagBackupDir)
+			}
+		}
 	} else {
 		ui.PrintPhaseSkipped(5, "BOOTSTRAP", "already completed")
 	}

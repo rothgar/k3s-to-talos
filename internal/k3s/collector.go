@@ -3,6 +3,7 @@ package k3s
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"net"
 	"strings"
 	"time"
@@ -36,6 +37,8 @@ type ClusterInfo struct {
 	// WorkloadFeatures describes workload-specific Talos configuration requirements
 	// discovered during the collect phase.
 	WorkloadFeatures WorkloadFeatures `json:"workload_features"`
+	// LocalPath describes the local-path-provisioner if detected.
+	LocalPath LocalPathInfo `json:"local_path,omitempty"`
 }
 
 // WorkloadFeatures captures Talos machine-config requirements implied by the
@@ -66,6 +69,13 @@ type PV struct {
 	StorageClass     string `json:"storage_class"`
 	Phase            string `json:"phase"`
 	ClaimRef         string `json:"claim_ref,omitempty"`
+	HostPath         string `json:"host_path,omitempty"` // local-path-provisioner host path
+}
+
+// LocalPathInfo holds information about the local-path-provisioner.
+type LocalPathInfo struct {
+	Detected bool   `json:"detected"`
+	HostPath string `json:"host_path"` // e.g. /opt/local-path-provisioner
 }
 
 // Collector gathers cluster information via SSH for both k3s and kubeadm nodes.
@@ -435,6 +445,12 @@ func (c *Collector) collectPVs(info *ClusterInfo) error {
 					Namespace string `json:"namespace"`
 					Name      string `json:"name"`
 				} `json:"claimRef"`
+				HostPath *struct {
+					Path string `json:"path"`
+				} `json:"hostPath"`
+				Local *struct {
+					Path string `json:"path"`
+				} `json:"local"`
 			} `json:"spec"`
 			Status struct {
 				Phase string `json:"phase"`
@@ -456,10 +472,70 @@ func (c *Collector) collectPVs(info *ClusterInfo) error {
 		if item.Spec.ClaimRef != nil {
 			pv.ClaimRef = fmt.Sprintf("%s/%s", item.Spec.ClaimRef.Namespace, item.Spec.ClaimRef.Name)
 		}
+		// Capture the host path for local-path-provisioner PVs.
+		// local-path-provisioner uses spec.hostPath; local PVs use spec.local.
+		if item.Spec.HostPath != nil {
+			pv.HostPath = item.Spec.HostPath.Path
+		} else if item.Spec.Local != nil {
+			pv.HostPath = item.Spec.Local.Path
+		}
 		info.PVs = append(info.PVs, pv)
 	}
 	info.PVCount = len(info.PVs)
+
+	c.detectLocalPathProvisioner(info)
 	return nil
+}
+
+// detectLocalPathProvisioner checks if local-path-provisioner is running and
+// identifies its host storage path from the ConfigMap or the PV paths.
+func (c *Collector) detectLocalPathProvisioner(info *ClusterInfo) {
+	// Check for the local-path-provisioner deployment (present in all k3s clusters
+	// by default, and optionally in kubeadm clusters).
+	out, _ := c.ssh.RunNoSudo(
+		c.kubectlBin() + ` get deploy -n kube-system local-path-provisioner --no-headers 2>/dev/null | wc -l`)
+	if strings.TrimSpace(out) == "0" || strings.TrimSpace(out) == "" {
+		return
+	}
+
+	info.LocalPath.Detected = true
+
+	// Try to read the config.json from the local-path-config ConfigMap to get
+	// the configured host path.
+	cfgOut, err := c.ssh.RunNoSudo(
+		c.kubectlBin() + ` get configmap -n kube-system local-path-config -o jsonpath='{.data.config\.json}' 2>/dev/null`)
+	if err == nil && cfgOut != "" {
+		var lpCfg struct {
+			NodePathMap []struct {
+				Paths []string `json:"paths"`
+			} `json:"nodePathMap"`
+		}
+		if json.Unmarshal([]byte(cfgOut), &lpCfg) == nil {
+			for _, n := range lpCfg.NodePathMap {
+				if len(n.Paths) > 0 {
+					info.LocalPath.HostPath = n.Paths[0]
+					break
+				}
+			}
+		}
+	}
+
+	// Fallback: infer from existing PV paths.
+	if info.LocalPath.HostPath == "" {
+		for _, pv := range info.PVs {
+			if pv.StorageClass == "local-path" && pv.HostPath != "" {
+				// The PV path looks like /opt/local-path-provisioner/pvc-xxx_ns_name.
+				// Extract the parent directory.
+				info.LocalPath.HostPath = filepath.Dir(pv.HostPath)
+				break
+			}
+		}
+	}
+
+	// Final fallback: k3s default.
+	if info.LocalPath.HostPath == "" {
+		info.LocalPath.HostPath = "/opt/local-path-provisioner"
+	}
 }
 
 // detectNetworkCIDRs attempts to discover the cluster-wide pod and service CIDRs.
