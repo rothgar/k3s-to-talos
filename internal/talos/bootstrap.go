@@ -33,10 +33,14 @@ type Bootstrapper struct {
 }
 
 // sshProbeAddr returns the SSH address to probe for the "rebooted into Ubuntu"
-// check.  When the SSH port is non-standard (e.g. QEMU user-mode forwarding),
-// we must probe the actual forwarded port — not hardcoded :22 which may be the
-// host's own SSH server.
+// check.  Returns "" when the probe would be unreliable:
+//   - localhost/127.0.0.1 with a non-standard port (QEMU user-mode networking
+//     always has the forwarded port in LISTEN state regardless of guest state)
+//   - localhost/127.0.0.1 with port 22 (may be the host's own SSH server)
 func (b *Bootstrapper) sshProbeAddr(host string) string {
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return "" // unreliable — QEMU SLiRP or host SSH always responds
+	}
 	port := b.sshPort
 	if port == 0 {
 		port = 22
@@ -411,10 +415,11 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 
 		// Periodically check if Ubuntu SSH is up — that means Talos failed to boot.
 		// Check every 30 s after the first 3 minutes (allow for initial reboot time).
-		if time.Since(start) > 3*time.Minute && time.Since(lastSSHCheck) > 30*time.Second {
+		if sshAddr := b.sshProbeAddr(host); sshAddr != "" &&
+			time.Since(start) > 3*time.Minute && time.Since(lastSSHCheck) > 30*time.Second {
 			lastSSHCheck = time.Now()
 			elapsed := time.Since(start).Round(time.Second)
-			if tcpProbe(b.sshProbeAddr(host), 3*time.Second) {
+			if tcpProbe(sshAddr, 3*time.Second) {
 				s.Stop()
 				return fmt.Errorf(
 					"machine at %s rebooted back into Ubuntu (port 22 is UP after %s, "+
@@ -566,7 +571,10 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 
 		// ── Port probes ───────────────────────────────────────────────────────
 		port50kUp := tcpProbe(host+":50000", 3*time.Second)
-		port22Up := tcpProbe(b.sshProbeAddr(host), 3*time.Second)
+		port22Up := false
+		if sshAddr := b.sshProbeAddr(host); sshAddr != "" {
+			port22Up = tcpProbe(sshAddr, 3*time.Second)
+		}
 
 		// ── Port-50000-UP soak ────────────────────────────────────────────────
 		// On Talos v1.12+ workers, machine.ca.key is absent so machined cannot
