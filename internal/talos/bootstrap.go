@@ -90,26 +90,17 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		inMaintenanceMode := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
 		if inMaintenanceMode {
 			fmt.Println("  Talos is in maintenance mode — applying control plane configuration...")
-			// Try apply-config without talosconfig first (pure insecure), then
-			// with talosconfig+insecure as a fallback.  Different Talos versions
-			// may require one or the other approach in maintenance mode.
-			applyErr := b.runTalosctlInsecure(talosctlPath,
+			// Use talosconfig + --insecure for the apply-config call.
+			// --insecure skips server cert verification (maintenance mode
+			// uses a self-signed cert) while the talosconfig provides
+			// enough TLS context for the handshake to succeed.
+			_, applyErr := b.runTalosctlWithOutput(talosctlPath, opts.TalosConfigFile,
 				"apply-config",
+				"--insecure",
 				"--nodes", opts.Host,
 				"--endpoints", opts.Host,
 				"--file", opts.ControlPlaneCfg,
 			)
-			if applyErr != nil {
-				color.Yellow("  apply-config (insecure, no talosconfig) failed: %v\n", summariseError(applyErr))
-				fmt.Println("  Retrying with talosconfig + --insecure...")
-				_, applyErr = b.runTalosctlWithOutput(talosctlPath, opts.TalosConfigFile,
-					"apply-config",
-					"--insecure",
-					"--nodes", opts.Host,
-					"--endpoints", opts.Host,
-					"--file", opts.ControlPlaneCfg,
-				)
-			}
 			if applyErr != nil {
 				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
 				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
@@ -465,13 +456,16 @@ func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host 
 	deadline := time.Now().Add(timeout)
 	wait := 3 * time.Second
 	for time.Now().Before(deadline) {
-		// Use --talosconfig but also --insecure so the CA check is skipped.
-		// In maintenance mode machined has a self-signed cert (CA mismatch
-		// unless we use --insecure).  In configured mode, machined requires
-		// client-cert mTLS — which --insecure suppresses — so this call
-		// will FAIL in configured mode (connection refused / auth error).
-		_, err := b.runTalosctlInsecureWithOutput(talosctlPath,
+		// Use the talosconfig with --insecure so that:
+		//  - TLS server cert verification is skipped (maintenance mode uses self-signed)
+		//  - The talosconfig provides enough TLS context for the handshake to complete
+		//
+		// Using TALOSCONFIG=/dev/null strips all TLS context and causes
+		// "authentication handshake failed: EOF" on some setups (e.g. QEMU
+		// user-mode networking).
+		out, err := b.runTalosctlWithOutput(talosctlPath, talosConfigFile,
 			"version",
+			"--insecure",
 			"--nodes", host,
 			"--endpoints", host,
 		)
@@ -490,6 +484,7 @@ func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host 
 			color.Green("  ✓ Maintenance-mode endpoint responded (gRPC Unimplemented = maintenance mode)\n")
 			return true
 		}
+		_ = out // logged via verbose
 		time.Sleep(wait)
 		if wait < 15*time.Second {
 			wait += 3 * time.Second
