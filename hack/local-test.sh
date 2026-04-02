@@ -351,7 +351,7 @@ vm_start() {
     -drive file="${disk}",if=virtio,format=qcow2 \
     -drive file="${seed}",media=cdrom \
     ${netdev_args} \
-    -nographic \
+    -display none \
     -serial file:"${WORK_DIR}/serial-${name}.log" \
     -daemonize \
     -pidfile "${WORK_DIR}/${name}.pid"
@@ -394,13 +394,13 @@ ensure_base_image() {
   mkdir -p "${CACHE_DIR}"
   local img="${CACHE_DIR}/${UBUNTU_IMG_NAME}"
   if [[ ! -f "${img}" ]]; then
-    log_info "Downloading Ubuntu 24.04 cloud image…"
+    log_info "Downloading Ubuntu 24.04 cloud image…" >&2
     curl -L --progress-bar -o "${img}.tmp" "${UBUNTU_IMG_URL}"
     mv "${img}.tmp" "${img}"
     chmod 444 "${img}"   # read-only; overlays are created separately
-    log_ok "Base image cached at ${img}"
+    log_ok "Base image cached at ${img}" >&2
   else
-    log_ok "Base image already cached: ${img}"
+    log_ok "Base image already cached: ${img}" >&2
   fi
   echo "${img}"
 }
