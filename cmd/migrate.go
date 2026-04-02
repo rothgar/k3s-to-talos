@@ -387,14 +387,39 @@ func printMigrationSuccess(state *MigrationState) {
 	step++
 
 	if len(state.ClusterInfo.Nodes) > 1 {
-		color.Yellow("  %d. This was a multi-node cluster. Migrate each remaining node:\n", step)
+		talosConfigDir := filepath.Join(state.BackupDir, "talos-config")
+
+		// Separate remaining nodes into control plane and worker.
+		var cpNodes, workerNodes []string
 		for _, node := range state.ClusterInfo.Nodes {
-			if node.IsControlPlane {
-				continue
+			if node.InternalIP == state.Host {
+				continue // skip the node we just migrated
 			}
-			fmt.Printf("       k3s-to-talos migrate --host <worker-ip> --cluster-name %s \\\n", state.ClusterName)
-			fmt.Printf("         --backup-dir %s-worker-%s --talos-version %s\n\n",
-				state.BackupDir, node.Name, state.TalosVersion)
+			if node.IsControlPlane {
+				cpNodes = append(cpNodes, node.Name)
+			} else {
+				workerNodes = append(workerNodes, node.Name)
+			}
+		}
+
+		if len(cpNodes) > 0 {
+			color.Yellow("  %d. Join remaining control plane nodes:\n", step)
+			for _, name := range cpNodes {
+				fmt.Printf("       k2t join-controlplane <user>@<%s-ip> \\\n", name)
+				fmt.Printf("         --controlplane-config %s/controlplane.yaml \\\n", talosConfigDir)
+				fmt.Printf("         --talosconfig %s/talosconfig\n\n", talosConfigDir)
+			}
+			step++
+		}
+
+		if len(workerNodes) > 0 {
+			color.Yellow("  %d. Join worker nodes:\n", step)
+			for _, name := range workerNodes {
+				fmt.Printf("       k2t join-worker <user>@<%s-ip> \\\n", name)
+				fmt.Printf("         --worker-config %s/worker.yaml \\\n", talosConfigDir)
+				fmt.Printf("         --talosconfig %s/talosconfig\n\n", talosConfigDir)
+			}
+			step++
 		}
 	}
 }

@@ -174,6 +174,7 @@ func init() {
 
 	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(joinWorkerCmd)
+	rootCmd.AddCommand(joinControlPlaneCmd)
 	rootCmd.AddCommand(collectCmd)
 	rootCmd.AddCommand(generateCmd)
 }

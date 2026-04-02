@@ -81,14 +81,53 @@ Progress is saved to `<backup-dir>/migration-state.json`. Resume without repeati
 k2t migrate ubuntu@10.1.1.1 --resume
 ```
 
+### Add a control plane node
+
+For multi-CP clusters, join additional control plane nodes after migrating the first one. The existing cluster is validated as healthy before proceeding:
+
+```bash
+k2t join-controlplane ubuntu@10.1.1.2 \
+  --controlplane-config ./k3s-backup/talos-config/controlplane.yaml \
+  --talosconfig         ./k3s-backup/talos-config/talosconfig
+```
+
+No etcd restore or bootstrap is needed — the new node discovers the existing etcd cluster and joins automatically.
+
 ### Add a worker node
 
 After migrating the control plane, convert worker nodes:
 
 ```bash
-k2t join-worker ubuntu@10.1.1.2 \
+k2t join-worker ubuntu@10.1.1.3 \
   --worker-config ./k3s-backup/talos-config/worker.yaml \
   --talosconfig   ./k3s-backup/talos-config/talosconfig
+```
+
+### Multi-node migration order
+
+For a 3-CP + 2-worker cluster:
+
+```bash
+# 1. Migrate the first control plane (etcd restore)
+k2t migrate ubuntu@10.1.1.1 --migrate-to-etcd
+
+# 2. Join additional control plane nodes
+k2t join-controlplane ubuntu@10.1.1.2 \
+  --controlplane-config ./k3s-backup/talos-config/controlplane.yaml \
+  --talosconfig ./k3s-backup/talos-config/talosconfig
+
+k2t join-controlplane ubuntu@10.1.1.3 \
+  --controlplane-config ./k3s-backup/talos-config/controlplane.yaml \
+  --talosconfig ./k3s-backup/talos-config/talosconfig
+
+# 3. Join workers
+k2t join-worker ubuntu@10.1.1.4 \
+  --worker-config ./k3s-backup/talos-config/worker.yaml \
+  --talosconfig ./k3s-backup/talos-config/talosconfig
+
+k2t join-worker ubuntu@10.1.1.5 \
+  --worker-config ./k3s-backup/talos-config/worker.yaml \
+  --talosconfig ./k3s-backup/talos-config/talosconfig
 ```
 
 ### Collect only (no migration)
@@ -142,6 +181,15 @@ SSH agent (`SSH_AUTH_SOCK`) is used automatically when available. When the SSH u
 | `--dry-run` | | Show plan without modifying anything |
 | `--resume` | | Resume from last completed phase |
 | `--yes` | | Skip confirmation prompt (CI/automation) |
+
+### `join-controlplane`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--talos-version` | `v1.12.6` | Talos Linux version to install |
+| `--controlplane-config` | _(required)_ | Path to `controlplane.yaml` from initial migration |
+| `--talosconfig` | _(required)_ | Path to `talosconfig` from initial migration |
+| `--skip-health-check` | | Skip cluster health validation before joining |
 
 ### `join-worker`
 

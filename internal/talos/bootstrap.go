@@ -178,6 +178,95 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	return nil
 }
 
+// ControlPlaneBootstrapOptions holds parameters for bootstrapping an additional
+// Talos control plane node that joins an existing cluster.
+type ControlPlaneBootstrapOptions struct {
+	Host                string
+	TalosConfigFile     string // talosconfig from the initial CP migration
+	ControlPlaneCfgFile string // controlplane.yaml from the initial migration
+	CertSANsPatch       string // YAML patch to inject machine.certSANs
+	Verbose             bool
+}
+
+// BootstrapControlPlane waits for Talos to boot on an additional control plane
+// node and applies the control plane configuration.  Unlike Bootstrap it does
+// NOT run etcd bootstrap or retrieve a kubeconfig — the new CP node discovers
+// the existing etcd cluster via the token embedded in controlplane.yaml and
+// automatically joins as a member.
+func (b *Bootstrapper) BootstrapControlPlane(opts ControlPlaneBootstrapOptions) error {
+	b.verbose = opts.Verbose
+	talosctlPath, err := exec.LookPath("talosctl")
+	if err != nil {
+		return fmt.Errorf("talosctl not found in PATH")
+	}
+
+	certSANsPatch := opts.CertSANsPatch
+
+	// Step 1: Wait for Talos to respond on port 50000.
+	if err := b.waitForTalosAPI(opts.Host); err != nil {
+		return err
+	}
+
+	// Step 2: Check if already configured; otherwise probe maintenance mode.
+	fmt.Println("  Checking if control plane node is already in configured mode...")
+	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+		"version",
+		"--nodes", opts.Host,
+		"--endpoints", opts.Host,
+	); err == nil {
+		color.Green("  ✓ Control plane node is already in configured mode\n")
+	} else {
+		fmt.Printf("  CA-verified check failed (%v)\n", summariseError(err))
+		fmt.Println("  Probing for maintenance mode...")
+		inMaintenance := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
+		if inMaintenance {
+			fmt.Println("  Node is in maintenance mode — applying control plane configuration...")
+			applyArgs := []string{
+				"apply-config",
+				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
+				"--file", opts.ControlPlaneCfgFile,
+			}
+			if certSANsPatch != "" {
+				applyArgs = append(applyArgs, "--config-patch", certSANsPatch)
+			}
+			if applyErr := b.runTalosctlInsecure(talosctlPath, applyArgs...); applyErr != nil {
+				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
+				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
+			} else {
+				color.Green("  ✓ Control plane config applied — waiting for reboot\n")
+			}
+		} else {
+			fmt.Println("  Maintenance-mode endpoint not responding — machine may be configured without public-IP certSANs.")
+			fmt.Println("  Attempting apply-config with talosconfig+insecure to inject certSANs...")
+			applyArgs := []string{
+				"apply-config",
+				"--insecure",
+				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
+				"--file", opts.ControlPlaneCfgFile,
+			}
+			if certSANsPatch != "" {
+				applyArgs = append(applyArgs, "--config-patch", certSANsPatch)
+			}
+			if _, applyErr := b.runTalosctlWithOutput(talosctlPath, opts.TalosConfigFile, applyArgs...); applyErr != nil {
+				color.Yellow("  apply-config (talosconfig+insecure) returned an error: %v\n", summariseError(applyErr))
+				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
+			} else {
+				color.Green("  ✓ apply-config (talosconfig+insecure) accepted — Talos will reboot with certSANs\n")
+			}
+		}
+	}
+
+	// Step 3: Wait for CA-verified gRPC API (CP auto-joins etcd via token).
+	fmt.Println("  Waiting for control plane Talos gRPC API to be ready (up to 35 minutes)...")
+	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host, opts.ControlPlaneCfgFile, certSANsPatch); err != nil {
+		return fmt.Errorf("waiting for control plane Talos after config apply: %w", err)
+	}
+
+	return nil
+}
+
 // WorkerBootstrapOptions holds parameters for bootstrapping a Talos worker node.
 type WorkerBootstrapOptions struct {
 	Host            string
@@ -925,7 +1014,7 @@ func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...stri
 	// Insert --insecure after the subcommand name (first arg).
 	var allArgs []string
 	if len(args) > 0 {
-		allArgs = append(append([]string{args[0], "--insecure"}, args[1:]...))
+		allArgs = append([]string{args[0], "--insecure"}, args[1:]...)
 	} else {
 		allArgs = []string{"--insecure"}
 	}
@@ -959,7 +1048,7 @@ func (b *Bootstrapper) runTalosctlInsecureWithOutput(binary string, args ...stri
 func (b *Bootstrapper) runTalosctlInsecure(binary string, args ...string) error {
 	var allArgs []string
 	if len(args) > 0 {
-		allArgs = append(append([]string{args[0], "--insecure"}, args[1:]...))
+		allArgs = append([]string{args[0], "--insecure"}, args[1:]...)
 	} else {
 		allArgs = []string{"--insecure"}
 	}
