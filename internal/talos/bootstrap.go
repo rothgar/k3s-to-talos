@@ -21,6 +21,7 @@ type BootstrapOptions struct {
 	ControlPlaneCfg  string
 	KubeconfigOut    string
 	EtcdSnapshotPath string // if set, run etcd recover instead of bootstrap
+	SSHPort          int    // SSH port used to connect (for the "rebooted into Ubuntu" probe; 0 = 22)
 	Verbose          bool   // print each talosctl invocation to stderr
 }
 
@@ -28,6 +29,19 @@ type BootstrapOptions struct {
 type Bootstrapper struct {
 	backupDir string
 	verbose   bool
+	sshPort   int // SSH port for the "rebooted into Ubuntu" probe (0 = 22)
+}
+
+// sshProbeAddr returns the SSH address to probe for the "rebooted into Ubuntu"
+// check.  When the SSH port is non-standard (e.g. QEMU user-mode forwarding),
+// we must probe the actual forwarded port — not hardcoded :22 which may be the
+// host's own SSH server.
+func (b *Bootstrapper) sshProbeAddr(host string) string {
+	port := b.sshPort
+	if port == 0 {
+		port = 22
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
 
 // NewBootstrapper creates a new Bootstrapper.
@@ -39,6 +53,7 @@ func NewBootstrapper(backupDir string) *Bootstrapper {
 // and retrieves the kubeconfig.
 func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	b.verbose = opts.Verbose
+	b.sshPort = opts.SSHPort
 	talosctlPath, err := exec.LookPath("talosctl")
 	if err != nil {
 		return fmt.Errorf("talosctl not found in PATH")
@@ -388,7 +403,7 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 		if time.Since(start) > 3*time.Minute && time.Since(lastSSHCheck) > 30*time.Second {
 			lastSSHCheck = time.Now()
 			elapsed := time.Since(start).Round(time.Second)
-			if tcpProbe(host+":22", 3*time.Second) {
+			if tcpProbe(b.sshProbeAddr(host), 3*time.Second) {
 				s.Stop()
 				return fmt.Errorf(
 					"machine at %s rebooted back into Ubuntu (port 22 is UP after %s, "+
@@ -540,7 +555,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 
 		// ── Port probes ───────────────────────────────────────────────────────
 		port50kUp := tcpProbe(host+":50000", 3*time.Second)
-		port22Up := tcpProbe(host+":22", 3*time.Second)
+		port22Up := tcpProbe(b.sshProbeAddr(host), 3*time.Second)
 
 		// ── Port-50000-UP soak ────────────────────────────────────────────────
 		// On Talos v1.12+ workers, machine.ca.key is absent so machined cannot

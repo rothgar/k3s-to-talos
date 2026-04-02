@@ -281,6 +281,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			ControlPlaneCfg:  controlPlaneCfg,
 			KubeconfigOut:    kubeconfigOut,
 			EtcdSnapshotPath: snapshotPath,
+			SSHPort:          sshOpts(target).Port,
 			Verbose:          flagVerbose,
 		}); err != nil {
 			return fmt.Errorf("bootstrapping Talos cluster: %w", err)
