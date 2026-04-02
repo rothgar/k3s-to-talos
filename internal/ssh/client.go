@@ -434,31 +434,36 @@ func formatDialError(host, addr string, err error) error {
 func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
-	// 1. SSH agent — try first so passphrase-protected keys work without
-	//    the tool needing to decrypt them directly.
+	// When an explicit key is provided via --ssh-key, try it FIRST — before
+	// the SSH agent.  The agent may hold many keys and the server's
+	// MaxAuthTries (default 6, sometimes 3) can be exhausted by agent keys
+	// before the explicit key gets a chance.
+	if keyPath != "" {
+		if signer, err := loadPrivateKey(keyPath); err == nil {
+			methods = append(methods, ssh.PublicKeys(signer))
+		}
+	}
+
+	// SSH agent — handles passphrase-protected keys transparently.
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
 			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
 		}
 	}
 
-	// 2. Key file: explicit path first, then common defaults.
-	candidates := []string{}
-	if keyPath != "" {
-		candidates = append(candidates, keyPath)
-	}
-	home, _ := os.UserHomeDir()
-	for _, name := range []string{"id_ed25519", "id_rsa", "id_ecdsa"} {
-		candidates = append(candidates, filepath.Join(home, ".ssh", name))
-	}
-	for _, p := range candidates {
-		if signer, err := loadPrivateKey(p); err == nil {
-			methods = append(methods, ssh.PublicKeys(signer))
-			break
+	// Default key files (only when no explicit key was provided or it failed
+	// to load — avoids double-trying the same key).
+	if keyPath == "" {
+		home, _ := os.UserHomeDir()
+		for _, name := range []string{"id_ed25519", "id_rsa", "id_ecdsa"} {
+			if signer, err := loadPrivateKey(filepath.Join(home, ".ssh", name)); err == nil {
+				methods = append(methods, ssh.PublicKeys(signer))
+				break
+			}
 		}
 	}
 
-	// 3. Password fallback.
+	// Password fallback.
 	methods = append(methods, ssh.PasswordCallback(func() (string, error) {
 		fmt.Printf("SSH password for %s: ", keyPath)
 		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
