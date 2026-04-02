@@ -439,13 +439,24 @@ func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host 
 		// unless we use --insecure).  In configured mode, machined requires
 		// client-cert mTLS — which --insecure suppresses — so this call
 		// will FAIL in configured mode (connection refused / auth error).
-		err := b.runTalosctlInsecure(talosctlPath,
+		_, err := b.runTalosctlInsecureWithOutput(talosctlPath,
 			"version",
 			"--nodes", host,
 			"--endpoints", host,
 		)
 		if err == nil {
 			color.Green("  ✓ Maintenance-mode endpoint responded (insecure)\n")
+			return true
+		}
+		// In maintenance mode, talosctl version --insecure may return a
+		// gRPC "Unimplemented" error because the full API isn't available.
+		// The gRPC response itself proves the node is up and in maintenance
+		// mode — treat this as a successful detection.
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "Unimplemented") ||
+			strings.Contains(errMsg, "maintenance mode") ||
+			strings.Contains(errMsg, "not implemented in maintenance") {
+			color.Green("  ✓ Maintenance-mode endpoint responded (gRPC Unimplemented = maintenance mode)\n")
 			return true
 		}
 		time.Sleep(wait)
