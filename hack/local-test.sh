@@ -48,8 +48,10 @@ WORKER_MAC="52:54:00:12:34:11"
 
 # User-mode port forwards (single-node fallback)
 UM_SSH_PORT=10022
-UM_TALOS_PORT=10500
-UM_K8S_PORT=10443
+# Talos API and K8s API must use identity-mapped ports because k2t and
+# talosctl hardcode 50000/6443 when talking to the node by IP.
+UM_TALOS_PORT=50000
+UM_K8S_PORT=6443
 
 # OVMF paths (tried in order)
 OVMF_CODE_CANDIDATES=(
